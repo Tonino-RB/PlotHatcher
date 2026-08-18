@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 200 100">
+  <text transform="matrix(1,0,0,1,50,0)" font-family="Arial" font-size="24">
+    <tspan x="10" y="50"><tspan font-weight="bold">Nested</tspan></tspan>
+  </text>
+</svg>

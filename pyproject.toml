@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fonthatch"
+version = "0.1.0"
+description = "Convert SVG text into pen-plotter hatch-filled outlines, built on vpype/vsketch"
+requires-python = ">=3.10"
+dependencies = [
+    "vpype>=1.14",
+    "vsketch>=1.0",
+    "uharfbuzz>=0.40",
+    "fonttools>=4.50",
+    "shapely>=2.0",
+    "lxml>=5.0",
+    "matplotlib>=3.8",
+    "click>=8.1",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+fonthatch = "fonthatch.cli.standalone:main"
+fonthatch-gui = "fonthatch.gui.sketch:launch"
+
+[project.entry-points."vpype.plugins"]
+fonthatch = "fonthatch.cli.vpype_plugin:fonthatch"
+fonthatch-write = "fonthatch.cli.vpype_plugin:fonthatch_write"
+
+[tool.setuptools.packages.find]
+where = ["src"]
