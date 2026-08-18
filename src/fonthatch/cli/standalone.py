@@ -75,6 +75,14 @@ def _length(ctx, param, value):
     help="How far a merge-ends bridge may stray outside the glyph before it's rejected.",
 )
 @click.option(
+    "--guarantee-coverage/--no-guarantee-coverage",
+    default=True,
+    show_default=True,
+    help="Run the top-up pass that guarantees complete coverage on the coverage fills "
+    "(spiraling/zigzag/glyph-fill). Turn off to let a wide --fill-spacing plot as the "
+    "open, faster pattern it sets instead of being filled back in solid.",
+)
+@click.option(
     "--font",
     "singleline_font",
     type=click.Choice(marked_font_names()),
@@ -133,6 +141,7 @@ def main(
     merge_ends,
     zigzag_passes,
     merge_tolerance,
+    guarantee_coverage,
     singleline_font,
     round_corners,
     draw_contour,
@@ -156,6 +165,7 @@ def main(
             merge_ends=merge_ends,
             zigzag_passes=zigzag_passes,
             merge_tolerance=merge_tolerance,
+            guarantee_coverage=guarantee_coverage,
         ),
         singleline_font=unmark_font_name(singleline_font),
         singleline_round_corners=round_corners,

@@ -270,6 +270,7 @@ def _push_render_params(sketch_cls: type, params: RenderParams) -> None:
     _set_param(sketch_cls.merge_ends, params.hatch.merge_ends)
     _set_param(sketch_cls.merge_tolerance, params.hatch.merge_tolerance)
     _set_param(sketch_cls.zigzag_passes, params.hatch.zigzag_passes)
+    _set_param(sketch_cls.guarantee_coverage, params.hatch.guarantee_coverage)
     _set_param(sketch_cls.draw_contour, params.draw_contour)
     _set_param(sketch_cls.draw_hatch, params.draw_hatch)
     _set_param(sketch_cls.contour_separate_layer, params.contour_separate_layer)
@@ -355,6 +356,13 @@ class FontHatchSketch(vsketch.SketchClass):
     merge_ends = vsketch.Param(True)
     merge_tolerance = vsketch.Param(0.0, 0.0, 20.0, step=0.05, unit="mm", decimals=2)
     zigzag_passes = vsketch.Param(1, 1, 3, step=1)
+    guarantee_coverage = vsketch.Param(True)
+    """On (coverage fills only: spiraling/zigzag/glyph_fill/tangent-or-tighter
+    concentric): the top-up pass tops up whatever fill_spacing left uncovered,
+    so the fill is always solid regardless of fill_spacing. Off: top-up is
+    skipped, so a fill_spacing opened up wider than the pen for a lighter,
+    faster-plotting pattern actually plots that way instead of being filled
+    back in solid."""
     draw_contour = vsketch.Param(True)
     draw_hatch = vsketch.Param(True)
     """Whether to fill the glyph with the hatch pattern at all (HATCH mode
@@ -365,6 +373,18 @@ class FontHatchSketch(vsketch.SketchClass):
 
     singleline_font = vsketch.Param("futural*", choices=marked_font_names())
     singleline_round_corners = vsketch.Param(False)
+
+    @property
+    def param_set(self) -> dict:
+        """Same as vsketch.SketchClass.param_set, minus input_path/output_path:
+        those describe which file is currently open, not a reusable hatching
+        setting, so a saved config shouldn't pin them and loading one
+        shouldn't overwrite whatever file is currently open."""
+        return {
+            name: value
+            for name, value in super().param_set.items()
+            if name not in ("input_path", "output_path")
+        }
 
     def _resolve_output_path(self) -> Path:
         if self.output_path:
@@ -409,6 +429,7 @@ class FontHatchSketch(vsketch.SketchClass):
                 merge_ends=self.merge_ends,
                 merge_tolerance=self.merge_tolerance,
                 zigzag_passes=self.zigzag_passes,
+                guarantee_coverage=self.guarantee_coverage,
             ),
             singleline_font=unmark_font_name(self.singleline_font),
             singleline_round_corners=self.singleline_round_corners,

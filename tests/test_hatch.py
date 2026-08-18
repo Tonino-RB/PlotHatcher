@@ -538,6 +538,83 @@ def test_glyph_fill_length_overhead_stays_bounded_across_pen_width_sweep():
         pen_width = round(pen_width + 0.05, 2)
 
 
+def test_guarantee_coverage_off_skips_topup_on_spiraling():
+    """A fill_spacing opened up wider than the pen is meant to plot as a
+    lighter, faster pattern — but with guarantee_coverage left at its
+    default of True, top-up quietly re-covers whatever that spacing opened,
+    so the wider spacing never actually shows up on paper. Turning it off
+    must both (a) leave real, measurable gaps and (b) draw noticeably less
+    ink than the guaranteed version at the same fill_spacing."""
+    pen_width = 0.5
+    wide_spacing = pen_width * 2.5
+
+    def uncovered_fraction(strokes) -> float:
+        outline_ink = SQUARE.exterior.buffer(pen_width / 2)
+        fill_ink = _fill_ink(strokes, pen_width) if strokes else Polygon()
+        uncovered = SQUARE.difference(unary_union([outline_ink, fill_ink]))
+        return uncovered.area / SQUARE.area
+
+    guaranteed = hatch_polygon(
+        SQUARE,
+        HatchParams(fill_type=FillType.SPIRALING, pen_width=pen_width, fill_spacing=wide_spacing, merge_ends=True),
+    )
+    open_pattern = hatch_polygon(
+        SQUARE,
+        HatchParams(
+            fill_type=FillType.SPIRALING,
+            pen_width=pen_width,
+            fill_spacing=wide_spacing,
+            merge_ends=True,
+            guarantee_coverage=False,
+        ),
+    )
+    assert uncovered_fraction(guaranteed) < _FULL_COVERAGE_TOLERANCE
+    assert uncovered_fraction(open_pattern) > 0.2
+
+    guaranteed_len = sum(s.length for s in guaranteed)
+    open_len = sum(s.length for s in open_pattern)
+    assert open_len < guaranteed_len * 0.7, (
+        f"guarantee_coverage=False drew {open_len:.1f} vs guarantee_coverage=True's "
+        f"{guaranteed_len:.1f} — top-up doesn't look skipped"
+    )
+
+
+def test_guarantee_coverage_off_skips_topup_on_glyph_fill():
+    """Same knob, glyph_fill side: with guarantee_coverage off, a wide
+    fill_spacing must leave measurable gaps and cost less ink than the
+    guaranteed version, instead of being quietly filled back in solid."""
+    pen_width = 0.5
+    wide_spacing = pen_width * 3.0
+
+    def uncovered_fraction(strokes) -> float:
+        contour = contour_geometry(SQUARE, ContourMode.OUTER, pen_width)
+        contour_ink = (
+            contour.boundary.buffer(pen_width / 2, join_style=1, quad_segs=16) if contour is not None else Polygon()
+        )
+        fill_ink = _fill_ink(strokes, pen_width) if strokes else Polygon()
+        uncovered = SQUARE.difference(unary_union([contour_ink, fill_ink]))
+        return uncovered.area / SQUARE.area
+
+    guaranteed = hatch_polygon(
+        SQUARE, HatchParams(fill_type=FillType.GLYPH_FILL, pen_width=pen_width, fill_spacing=wide_spacing)
+    )
+    open_pattern = hatch_polygon(
+        SQUARE,
+        HatchParams(
+            fill_type=FillType.GLYPH_FILL, pen_width=pen_width, fill_spacing=wide_spacing, guarantee_coverage=False
+        ),
+    )
+    assert uncovered_fraction(guaranteed) < _FULL_COVERAGE_TOLERANCE
+    assert uncovered_fraction(open_pattern) > 0.2
+
+    guaranteed_len = sum(s.length for s in guaranteed)
+    open_len = sum(s.length for s in open_pattern)
+    assert open_len < guaranteed_len * 0.7, (
+        f"guarantee_coverage=False drew {open_len:.1f} vs guarantee_coverage=True's "
+        f"{guaranteed_len:.1f} — top-up doesn't look skipped"
+    )
+
+
 def test_zigzag_three_passes_are_distinct_angles():
     """zigzag_passes=3 spreads passes across angle/angle+60/angle+120."""
     params = HatchParams(fill_type=FillType.ZIGZAG, angle=0.0, pen_width=2.0, zigzag_passes=3)

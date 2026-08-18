@@ -45,7 +45,10 @@ Six fill types:
 and all reach it the same way: lay the primary pattern, measure what it
 genuinely missed (see :func:`_ink_of`), cover the leftovers with
 :func:`_topup`, then thread the result into as few strokes as possible with
-:func:`_thread`.
+:func:`_thread`. That promise is what ``HatchParams.guarantee_coverage``
+(on by default) turns off: skip :func:`_topup` and a wide ``fill_spacing``
+plots as the open, faster pattern it was set to instead of getting quietly
+filled back in solid.
 
 ``merge_ends`` threads consecutive rings/rows into one continuous stroke
 instead of lifting the pen between each. Every bridge is checked to stay
@@ -204,9 +207,25 @@ class HatchParams:
     tied to the pen, not to a pattern. ``None`` means one full ``pen_width``,
     i.e. adjacent strokes exactly tangent, which is what makes those modes
     fill solid. Set it smaller to lay ink down heavier (strokes overlap), or
-    larger to open the fill up — at which point the coverage guarantee no
-    longer applies, since the top-up pass only closes gaps the pattern left
-    by accident, not ones the spacing opened deliberately."""
+    larger to open the fill up — but with ``guarantee_coverage`` left at its
+    default of ``True`` the top-up pass will simply re-cover whatever that
+    wider spacing opened, since as far as it can tell that's a gap the
+    pattern left by accident rather than one asked for. Turn
+    ``guarantee_coverage`` off to actually get the opened-up, faster-plotting
+    pattern this produces on paper."""
+    guarantee_coverage: bool = True
+    """Whether the coverage fills (spiraling, zigzag, glyph_fill, and
+    concentric when its spacing is tangent-or-tighter than the pen) run their
+    top-up pass at all. On by default, which is what makes those fills solid:
+    top-up measures whatever the primary pattern missed and covers exactly
+    that, regardless of why it was missed. That "regardless of why" is the
+    catch — it also erases any gap ``fill_spacing`` opened up on purpose, so
+    a spacing set wide for a quicker, more open pattern still plots as a
+    solid fill, with all the extra strokes that took. Turn this off to skip
+    top-up and let the pattern's own spacing stand: coverage is then whatever
+    the primary pattern's spacing naturally gives it, no longer guaranteed
+    complete, in exchange for a shorter, sparser plot when that's the
+    goal."""
 
 
 def hatch_polygon(polygon: BaseGeometry | None, params: HatchParams) -> list[LineString]:
@@ -220,10 +239,11 @@ def hatch_polygon(polygon: BaseGeometry | None, params: HatchParams) -> list[Lin
     tol = params.merge_tolerance
     step = params.fill_spacing if params.fill_spacing else params.pen_width
 
+    guarantee = params.guarantee_coverage
     if params.fill_type == FillType.SPIRALING:
-        return _spiraling(pieces, params.pen_width, step, params.inset, params.merge_ends, tol)
+        return _spiraling(pieces, params.pen_width, step, params.inset, params.merge_ends, tol, guarantee)
     if params.fill_type == FillType.CONCENTRIC:
-        return _concentric(pieces, params.pen_width, params.spacing, params.inset, params.merge_ends, tol)
+        return _concentric(pieces, params.pen_width, params.spacing, params.inset, params.merge_ends, tol, guarantee)
     if params.fill_type == FillType.LINES:
         return _scanline_fill(pieces, params.angle, params.spacing, params.inset, params.merge_ends, tol)
     if params.fill_type == FillType.CROSSHATCH:
@@ -235,10 +255,10 @@ def hatch_polygon(polygon: BaseGeometry | None, params: HatchParams) -> list[Lin
         strokes: list[LineString] = []
         for i in range(passes):
             pass_angle = params.angle + i * (180.0 / passes)
-            strokes.extend(_zigzag(pieces, params.pen_width, pass_angle, step, params.inset, tol))
+            strokes.extend(_zigzag(pieces, params.pen_width, pass_angle, step, params.inset, tol, guarantee))
         return strokes
     if params.fill_type == FillType.GLYPH_FILL:
-        return _glyph_fill(pieces, params.pen_width, step, params.inset, tol)
+        return _glyph_fill(pieces, params.pen_width, step, params.inset, tol, guarantee)
     raise ValueError(f"Unknown fill type: {params.fill_type}")
 
 
@@ -480,7 +500,13 @@ def _spiral_from_chain(chain: list[LinearRing], ring_spacing: float) -> list[Lin
 
 
 def _spiraling(
-    pieces: list[Polygon], pen_width: float, ring_spacing: float, inset: float, merge_ends: bool, tol: float
+    pieces: list[Polygon],
+    pen_width: float,
+    ring_spacing: float,
+    inset: float,
+    merge_ends: bool,
+    tol: float,
+    guarantee_coverage: bool = True,
 ) -> list[LineString]:
     strokes: list[LineString] = []
     for piece in pieces:
@@ -491,7 +517,8 @@ def _spiraling(
                 piece_strokes.extend(_spiral_from_chain(chain, ring_spacing))
             else:
                 piece_strokes.extend(LineString(loop.coords) for loop in chain)
-        piece_strokes.extend(_topup(piece, piece_strokes + _contour_lines(piece, pen_width), pen_width))
+        if guarantee_coverage:
+            piece_strokes.extend(_topup(piece, piece_strokes + _contour_lines(piece, pen_width), pen_width))
         if merge_ends:
             piece_strokes = _thread(piece_strokes, piece, max_bridge=pen_width * _GLYPH_FILL_MAX_BRIDGE, tol=tol, pen_width=pen_width)
         strokes.extend(piece_strokes)
@@ -502,7 +529,13 @@ def _spiraling(
 
 
 def _concentric(
-    pieces: list[Polygon], pen_width: float, spacing: float, inset: float, merge_ends: bool, tol: float
+    pieces: list[Polygon],
+    pen_width: float,
+    spacing: float,
+    inset: float,
+    merge_ends: bool,
+    tol: float,
+    guarantee_coverage: bool = True,
 ) -> list[LineString]:
     """Outside-in closed loops: the glyph's own outline repeated inward as
     many times as it fits.
@@ -525,7 +558,7 @@ def _concentric(
                 for ring in (poly.exterior, *poly.interiors):
                     if ring.length > spacing * _CONCENTRIC_MIN_RING_FACTOR:
                         rings.append(LineString(ring.coords))
-        if solid:
+        if solid and guarantee_coverage:
             rings.extend(_topup(piece, rings, pen_width))
         if merge_ends and rings:
             strokes.extend(_thread(rings, piece, max_bridge=spacing * 4, tol=tol, pen_width=pen_width))
@@ -575,7 +608,13 @@ def _row_spans(domain: Polygon, angle: float, spacing: float):
 
 
 def _zigzag(
-    pieces: list[Polygon], pen_width: float, angle: float, spacing: float, inset: float, tol: float
+    pieces: list[Polygon],
+    pen_width: float,
+    angle: float,
+    spacing: float,
+    inset: float,
+    tol: float,
+    guarantee_coverage: bool = True,
 ) -> list[LineString]:
     """``lines``, but continuous: one long back-and-forth stroke.
 
@@ -641,7 +680,8 @@ def _zigzag(
                 if len(pts) >= 2:
                     paths.append(LineString(pts))
             unrotated = [shapely_rotate(p, angle, origin=centroid, use_radians=False) for p in paths]
-            unrotated.extend(_topup(piece, unrotated + _contour_lines(piece, pen_width), pen_width))
+            if guarantee_coverage:
+                unrotated.extend(_topup(piece, unrotated + _contour_lines(piece, pen_width), pen_width))
             strokes.extend(_thread(unrotated, piece, max_bridge=pen_width * _GLYPH_FILL_MAX_BRIDGE, tol=tol, pen_width=pen_width))
     return strokes
 
@@ -649,7 +689,14 @@ def _zigzag(
 # --- glyph_fill -----------------------------------------------------------
 
 
-def _glyph_fill(pieces: list[Polygon], pen_width: float, ring_spacing: float, inset: float, tol: float) -> list[LineString]:
+def _glyph_fill(
+    pieces: list[Polygon],
+    pen_width: float,
+    ring_spacing: float,
+    inset: float,
+    tol: float,
+    guarantee_coverage: bool = True,
+) -> list[LineString]:
     """Contour-led fill: only what the OUTER contour could not reach.
 
     The contour already inks a full pen width in from the true edge, so the
@@ -665,7 +712,8 @@ def _glyph_fill(pieces: list[Polygon], pen_width: float, ring_spacing: float, in
         piece_strokes: list[LineString] = []
         for chain in _ring_chains(piece, pen_width + spacing / 2 + inset, spacing):
             piece_strokes.extend(_spiral_from_chain(chain, spacing))
-        piece_strokes.extend(_topup(piece, piece_strokes + contour_lines, pen_width))
+        if guarantee_coverage:
+            piece_strokes.extend(_topup(piece, piece_strokes + contour_lines, pen_width))
         if piece_strokes:
             strokes.extend(_thread(piece_strokes, piece, max_bridge=pen_width * _GLYPH_FILL_MAX_BRIDGE, tol=tol, pen_width=pen_width))
     return strokes
