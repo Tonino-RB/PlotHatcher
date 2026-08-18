@@ -154,28 +154,37 @@ def _parse_transform(transform_str: str | None) -> se.Matrix:
         return se.Matrix()
 
 
-def _root_viewport_matrix(root) -> se.Matrix:
+def root_viewport_matrix(root) -> tuple[se.Matrix, float, float]:
     """Maps viewBox-space coordinates to document px space (96dpi CSS px,
     matching vpype's own internal convention), folding in any physical
-    width/height <-> viewBox scale mismatch."""
+    width/height <-> viewBox scale mismatch. Also returns that document-px
+    (width, height) — the same page size vpype's own reader/writer would use
+    for this file — since callers that need to place fresh geometry back
+    into viewBox space (see compose.py) need both the matrix and the size it
+    was derived from."""
     viewbox = root.get("viewBox")
     if not viewbox:
-        return se.Matrix()
+        return se.Matrix(), 0.0, 0.0
     parts = re.split(r"[ ,]+", viewbox.strip())
     if len(parts) != 4:
-        return se.Matrix()
+        return se.Matrix(), 0.0, 0.0
     try:
         minx, miny, vb_w, vb_h = (float(p) for p in parts)
     except ValueError:
-        return se.Matrix()
+        return se.Matrix(), 0.0, 0.0
     if vb_w == 0 or vb_h == 0:
-        return se.Matrix()
+        return se.Matrix(), 0.0, 0.0
 
     width = _length_px(root.get("width"), vb_w)
     height = _length_px(root.get("height"), vb_h)
     scale_x = width / vb_w
     scale_y = height / vb_h
-    return se.Matrix(scale_x, 0, 0, scale_y, -scale_x * minx, -scale_y * miny)
+    matrix = se.Matrix(scale_x, 0, 0, scale_y, -scale_x * minx, -scale_y * miny)
+    return matrix, width, height
+
+
+def _root_viewport_matrix(root) -> se.Matrix:
+    return root_viewport_matrix(root)[0]
 
 
 def _extract_digit_group(label: str | None) -> str | None:
@@ -217,6 +226,29 @@ def _toplevel_layer_ids(root) -> list[int]:
         group_index += 1
         ids.append(lid)
     return ids
+
+
+toplevel_layer_ids = _toplevel_layer_ids
+"""Public alias — used outside this module (see compose.py) to graft new
+content onto the same top-level layer a given TextRun.layer_index came
+from."""
+
+
+def toplevel_layer_labels(root) -> dict[int, str]:
+    """layer id -> the human-readable label ``compose.py`` should derive its
+    new "<label> hatched"/"<label> contour" layer names from: an Inkscape
+    ``inkscape:label``, else a plain ``id``, for whichever top-level ``<g>``
+    first introduced that layer id (see ``_toplevel_layer_ids``). A layer id
+    with no labelled group backing it (e.g. the "bare elements go to layer
+    1" catch-all) is simply absent — callers fall back to a generic name."""
+    labels: dict[int, str] = {}
+    for child, lid in zip(root, _toplevel_layer_ids(root)):
+        if lid in labels or _local_name(child.tag) != "g":
+            continue
+        label = child.get(_INKSCAPE_LABEL) or child.get("id")
+        if label:
+            labels[lid] = label
+    return labels
 
 
 def _collect_runs(
@@ -323,7 +355,7 @@ def _walk(el, transform: se.Matrix, blocks: list[TextBlock], layer_index: int) -
 def extract_text_blocks(svg_path: str) -> list[TextBlock]:
     """Parse ``svg_path`` and return all text blocks in document order."""
     root = etree.parse(svg_path).getroot()
-    viewport_matrix = _root_viewport_matrix(root)
+    viewport_matrix, _width, _height = root_viewport_matrix(root)
     layer_ids = _toplevel_layer_ids(root)
     blocks: list[TextBlock] = []
     for i, child in enumerate(root):

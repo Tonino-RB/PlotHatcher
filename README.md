@@ -4,11 +4,21 @@ Turn SVG text into pen-plotter-ready outlines: hatch-filled glyphs or single-str
 substitutions, built on [vpype](https://github.com/abey79/vpype) and
 [vsketch](https://github.com/abey79/vsketch).
 
-Every `<text>` element in an input SVG is isolated into a hidden "text" layer and a
-"hatched" (or single-line) layer. In hatch mode, each glyph keeps its true outline while its
-interior is filled with one of several plotter-friendly patterns; in singleline mode, glyphs
-are replaced with a Hershey-style single-stroke font. The output is a real plotter file — the
-same pipeline the CLI and specimen sheets use — so what you see is what the pen draws.
+The input SVG is read and written back as-is — every shape, group, gradient, and the document's
+own layer structure and labels pass through untouched, compatible with files from Inkscape,
+Illustrator, Affinity, and Figma. Only two things change: every original `<text>` element is
+hidden in place (still real, editable text — never converted to outlines), and for each of the
+source file's own top-level layers that has text, a new "`<layer>` hatched" (and, optionally,
+"`<layer>` contour") layer is added right after it, independently toggleable from every other
+layer. In hatch mode, each glyph keeps its true outline while its interior is filled with one of
+several plotter-friendly patterns; in singleline mode, glyphs are replaced with a Hershey-style
+single-stroke font. The output is a real plotter file — the same pipeline the CLI and specimen
+sheets use — so what you see is what the pen draws.
+
+(The GUI's live preview is the one exception: since it's built on vsketch/vpype, which can only
+render line geometry, the on-screen preview approximates the source file — flattening non-text
+content to lines and showing a glyph-outline stand-in instead of real `<text>`. Its Export button
+writes the same fully-preserving output as the CLI.)
 
 ## Fill types
 

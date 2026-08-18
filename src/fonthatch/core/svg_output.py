@@ -28,11 +28,11 @@ def render_svg(document: vpype.Document, hidden_layer_ids: list[int] | None = No
     hidden_ids = {f"layer{layer_id}" for layer_id in hidden_layer_ids}
     for el in root.iter():
         if el.get("id") in hidden_ids:
-            _set_display_none(el)
+            set_display_none(el)
     return etree.tostring(root, xml_declaration=True, encoding="utf-8", standalone=False).decode("utf-8")
 
 
-def _set_display_none(el: etree._Element) -> None:
+def set_display_none(el: etree._Element) -> None:
     style = el.get("style", "")
     props = dict(
         (part.split(":", 1)[0].strip(), part.split(":", 1)[1].strip()) for part in style.split(";") if ":" in part
@@ -67,7 +67,7 @@ def hide_layers_in_file(path: str, layer_names: Iterable[str]) -> None:
     changed = False
     for el in root.iter():
         if etree.QName(el).localname == "g" and el.get(_INKSCAPE_LABEL) in names:
-            _set_display_none(el)
+            set_display_none(el)
             changed = True
     if changed:
         tree.write(path, xml_declaration=True, encoding="utf-8", standalone=False)

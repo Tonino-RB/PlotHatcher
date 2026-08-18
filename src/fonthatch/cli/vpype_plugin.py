@@ -48,7 +48,8 @@ from ..core.svg_output import write_svg
     type=vpype_cli.LengthType(),
     default=None,
     help="Line-to-line spacing for the coverage fills (spiraling/zigzag/glyph-fill). "
-    "Defaults to the pen width, i.e. adjacent strokes exactly tangent.",
+    "Defaults to the pen width (adjacent strokes exactly tangent) with --guarantee-coverage, "
+    "or a wider open spacing with --no-guarantee-coverage.",
 )
 @click.option("--inset", type=vpype_cli.LengthType(), default="0mm", show_default=True, help="Shrink the outline before filling.")
 @click.option("--angle", type=vpype_cli.AngleType(), default="45deg", show_default=True, help="Hatch angle (lines/crosshatch).")

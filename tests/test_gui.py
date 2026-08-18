@@ -36,6 +36,26 @@ def _reset_params():
     sketch_module._default_render_params = RenderParams()
     sketch_module._layer_overrides.clear()
     sketch_module._last_seen_render_params = None
+    # `_last_seen_render_params = None` above already makes the very next
+    # draw() look "dirty" regardless of this value (see _sync_selection),
+    # which forces it back to False immediately — so this is just making
+    # that starting state explicit, matching a freshly opened file. Tests
+    # that need to inspect genuinely computed hatch/contour content (not
+    # just structural things like layer names or the export path, which
+    # always compute for real — see `_compute`) must go through `_compute()`.
+    sketch_module._preview_computed = False
+
+
+def _compute():
+    """Simulates the sidebar's "Compute Preview" button for a headless test:
+    one redraw to let `_sync_selection` settle whatever was just edited
+    (which otherwise marks the live preview not-yet-computed the instant it
+    runs — see `sketch_module._preview_computed`), then a second, forced
+    redraw that actually renders real hatch/contour content. Returns that
+    second redraw's sketch instance."""
+    FontHatchSketch.execute(finalize=True)
+    sketch_module._preview_computed = True
+    return FontHatchSketch.execute(finalize=True)
 
 
 def _write_two_texts_svg(path: Path) -> None:
@@ -58,6 +78,34 @@ def _write_two_layers_svg(path: Path) -> None:
   </g>
 </svg>"""
     )
+
+
+def _exported_hatched_group(svg_text: str, layer_id: int = 1):
+    from lxml import etree
+
+    root = etree.fromstring(svg_text.encode("utf-8"))
+    return next(el for el in root.iter() if el.get("id") == f"fonthatch-hatched-{layer_id}")
+
+
+def _exported_hatched_segment_count(svg_text: str, layer_id: int = 1) -> int:
+    """Matches vpype's own LineCollection.segment_count() semantics (total
+    segments, i.e. points-1, across all lines) so it's directly comparable
+    against the live-preview counts `_hatched_segment_count` reads off
+    vpype's Document — vpype's writer emits a 2-point line as `<line>`, a
+    closed line (first point == last) as `<polygon points="...">` with the
+    duplicate closing point dropped (so segments == point count, the closing
+    edge being implicit), and anything else as `<polyline points="...">`
+    (segments == point count - 1)."""
+    total = 0
+    for el in _exported_hatched_group(svg_text, layer_id):
+        tag = el.tag.rsplit("}", 1)[-1]
+        if tag == "line":
+            total += 1
+        elif tag == "polyline":
+            total += max(0, len(el.get("points", "").split()) - 1)
+        elif tag == "polygon":
+            total += len(el.get("points", "").split())
+    return total
 
 
 def _hatched_segment_count(sketch) -> int:
@@ -94,7 +142,7 @@ def test_live_preview_redraw_writes_nothing_to_disk(tmp_path):
     assert not out_path.exists()
 
 
-def test_export_writes_hidden_text_layer(tmp_path):
+def test_export_hides_original_text_and_writes_visible_hatched_layer(tmp_path):
     """Exercises the same export_full_document() + _write_output() the
     sidebar's "Export" button (SketchViewer.on_like, patched in
     _patch_gui_chrome) calls directly."""
@@ -102,14 +150,13 @@ def test_export_writes_hidden_text_layer(tmp_path):
     out_path = tmp_path / "out.svg"
     FontHatchSketch.output_path.set_value(str(out_path))
     sketch = FontHatchSketch.execute(finalize=True)
-    doc, text_id = sketch.export_full_document()
-    sketch._write_output(doc, text_id)
+    svg_text = sketch.export_full_document()
+    sketch._write_output(svg_text)
 
     assert out_path.exists()
-    svg_text = out_path.read_text()
-    assert 'inkscape:label="text"' in svg_text
-    assert 'inkscape:label="hatched"' in svg_text
-    assert "display:none" in svg_text
+    written = out_path.read_text()
+    assert list(_exported_hatched_group(written))
+    assert "display:none" in written  # the original <text>, hidden in place
 
 
 def test_export_output_has_no_fill_and_stroke_width_set(tmp_path):
@@ -123,14 +170,10 @@ def test_export_output_has_no_fill_and_stroke_width_set(tmp_path):
     out_path = tmp_path / "out.svg"
     FontHatchSketch.output_path.set_value(str(out_path))
     sketch = FontHatchSketch.execute(finalize=True)
-    doc, text_id = sketch.export_full_document()
-    sketch._write_output(doc, text_id)
+    svg_text = sketch.export_full_document()
+    sketch._write_output(svg_text)
 
-    from lxml import etree
-
-    root = etree.fromstring(out_path.read_bytes())
-    groups = [el for el in root.iter() if el.tag.endswith("}g")]
-    hatched = next(g for g in groups if g.get("{http://www.inkscape.org/namespaces/inkscape}label") == "hatched")
+    hatched = _exported_hatched_group(out_path.read_text())
     assert hatched.get("fill") == "none"
     # pen_width is a "mm"-unit Param: the raw 0.42 typed in the UI is stored
     # converted to px (vpype's native document unit) by the time it lands in
@@ -148,8 +191,8 @@ def test_export_refuses_to_overwrite_input_file(tmp_path):
     FontHatchSketch.input_path.set_value(str(src))
     FontHatchSketch.output_path.set_value(str(src))
     sketch = FontHatchSketch.execute(finalize=True)
-    doc, text_id = sketch.export_full_document()
-    sketch._write_output(doc, text_id)
+    svg_text = sketch.export_full_document()
+    sketch._write_output(svg_text)
 
     assert src.read_text() == original_contents
 
@@ -176,7 +219,7 @@ def test_selecting_layer_only_changes_that_layers_settings(tmp_path):
     _reset_params()
     FontHatchSketch.input_path.set_value(str(src))
     default_params = FontHatchSketch()._render_params()
-    baseline = _hatched_segment_count(FontHatchSketch.execute(finalize=True))
+    baseline = _hatched_segment_count(_compute())
     assert baseline == isolated_segment_count(default_params)
 
     # Just looking at layer #1 (no setting touched) must change nothing.
@@ -188,7 +231,7 @@ def test_selecting_layer_only_changes_that_layers_settings(tmp_path):
     FontHatchSketch.fill_type.set_value("zigzag")
     FontHatchSketch.zigzag_passes.set_value(2)
     zigzag_params = FontHatchSketch()._render_params()
-    overridden = _hatched_segment_count(FontHatchSketch.execute(finalize=True))
+    overridden = _hatched_segment_count(_compute())
     assert overridden == isolated_segment_count(zigzag_params)
     assert overridden != baseline
 
@@ -199,13 +242,8 @@ def test_selecting_layer_only_changes_that_layers_settings(tmp_path):
     assert _hatched_segment_count(sketch) == overridden
 
     # Export must reflect the same per-layer split as the live preview.
-    export_doc, _ = sketch.export_full_document()
-    for lc in export_doc.layers.values():
-        if lc.property(vpype.METADATA_FIELD_NAME) == "hatched":
-            assert lc.segment_count() == overridden
-            break
-    else:
-        raise AssertionError("no hatched layer found in exported document")
+    svg_text = sketch.export_full_document()
+    assert _exported_hatched_segment_count(svg_text) == overridden
 
 
 def test_switching_selection_shows_that_targets_own_stored_settings(tmp_path):
@@ -255,13 +293,13 @@ def test_reset_selected_layer_clears_override_and_deselects(tmp_path):
     _reset_params()
     FontHatchSketch.input_path.set_value(str(src))
     default_params = FontHatchSketch()._render_params()
-    baseline = _hatched_segment_count(FontHatchSketch.execute(finalize=True))
+    baseline = _hatched_segment_count(_compute())
 
     # Give layer #1 its own override.
     FontHatchSketch.selected_layer.set_value(1)
     FontHatchSketch.fill_type.set_value("zigzag")
     FontHatchSketch.zigzag_passes.set_value(2)
-    overridden = _hatched_segment_count(FontHatchSketch.execute(finalize=True))
+    overridden = _hatched_segment_count(_compute())
     assert overridden != baseline
 
     # Reset it.
@@ -316,9 +354,8 @@ def test_selection_highlight_layer_only_when_something_selected(tmp_path):
     names = {lc.property(vpype.METADATA_FIELD_NAME) for lc in sketch.vsk.document.layers.values()}
     assert sketch_module.SELECTION_LAYER_NAME in names
 
-    export_doc, _ = sketch.export_full_document()
-    export_names = {lc.property(vpype.METADATA_FIELD_NAME) for lc in export_doc.layers.values()}
-    assert sketch_module.SELECTION_LAYER_NAME not in export_names
+    svg_text = sketch.export_full_document()
+    assert sketch_module.SELECTION_LAYER_NAME not in svg_text
 
 
 def test_post_finalize_hides_selection_layer_too(tmp_path):
@@ -357,7 +394,7 @@ def test_mode_switch_changes_hatched_layer_geometry():
 
     _reset_params()
     FontHatchSketch.mode.set_value("hatch")
-    hatch_count = hatched_segment_count()
+    hatch_count = _hatched_segment_count(_compute())
 
     FontHatchSketch.mode.set_value("singleline")
     singleline_count = hatched_segment_count()
@@ -370,10 +407,10 @@ def test_draw_hatch_false_omits_fill_from_hatched_layer():
     — turning it off must still leave the contour (draw_contour defaults
     True), just without the fill strokes."""
     _reset_params()
-    with_fill = _hatched_segment_count(FontHatchSketch.execute(finalize=True))
+    with_fill = _hatched_segment_count(_compute())
 
     FontHatchSketch.draw_hatch.set_value(False)
-    contour_only = _hatched_segment_count(FontHatchSketch.execute(finalize=True))
+    contour_only = _hatched_segment_count(_compute())
     assert contour_only < with_fill
     assert contour_only > 0  # the contour itself is still drawn
 
@@ -382,7 +419,7 @@ def test_draw_hatch_and_draw_contour_both_false_is_empty():
     _reset_params()
     FontHatchSketch.draw_hatch.set_value(False)
     FontHatchSketch.draw_contour.set_value(False)
-    assert _hatched_segment_count(FontHatchSketch.execute(finalize=True)) == 0
+    assert _hatched_segment_count(_compute()) == 0
 
 
 def test_singleline_mode_headless():
@@ -407,6 +444,24 @@ def test_merge_tolerance_param_headless():
     FontHatchSketch.merge_tolerance.set_value(0.5)
     sketch = FontHatchSketch.execute(finalize=True)
     assert not sketch.vsk.document.is_empty()
+
+
+def test_live_preview_withholds_fill_until_computed():
+    """Opening a file (or editing a setting) must show only the glyphs' raw
+    outlines — no contour, no hatch fill — until "Compute Preview" is
+    pressed, so opening/scrubbing never pays for the expensive hatch
+    computation unless the user actually asks to see it."""
+    _reset_params()
+    assert _hatched_segment_count(FontHatchSketch.execute(finalize=True)) == 0
+
+    computed = _hatched_segment_count(_compute())
+    assert computed > 0
+
+    # Editing a setting afterward reverts to the raw-outline preview again,
+    # until Compute Preview is pressed a second time.
+    FontHatchSketch.spacing.set_value(2.0)
+    assert _hatched_segment_count(FontHatchSketch.execute(finalize=True)) == 0
+    assert _hatched_segment_count(_compute()) > 0
 
 
 def test_missing_input_file_does_not_crash():

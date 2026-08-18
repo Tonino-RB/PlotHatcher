@@ -15,11 +15,13 @@ Six fill types:
   Ring 0 is offset inward by ``pen_width / 2`` so the pen's *outer* edge
   (not its centerline) is tangent to the true outline; each further ring is
   offset by another full ``pen_width`` so adjacent strokes are tangent.
-  Rings are traced *in full* and joined to the next at their nearest point,
-  which costs one short radial jog per revolution but makes coverage exactly
-  the rings' own coverage. (Morphing consecutive rings into a seamless
-  spiral was tried instead — see the note on ``_spiral_from_chain`` — and
-  loses coverage where the ring-to-ring correspondence stretches.)
+  Rings are traced *in full* and joined to the next at the true nearest
+  point on it (found by projecting, not by snapping to a vertex — see
+  :func:`_roll_to`), which costs one short radial jog per revolution but
+  makes coverage exactly the rings' own coverage. (Morphing consecutive
+  rings into a seamless spiral was tried instead — see the note on
+  ``_spiral_from_chain`` — and loses coverage where the ring-to-ring
+  correspondence stretches.)
 - ``concentric``: the glyph's outline repeated inward as many times as it
   fits, spaced by the generic ``spacing`` param — an onion-skin pattern
   rather than a solid fill, so its gaps are the point and are left alone.
@@ -48,7 +50,11 @@ genuinely missed (see :func:`_ink_of`), cover the leftovers with
 :func:`_thread`. That promise is what ``HatchParams.guarantee_coverage``
 (on by default) turns off: skip :func:`_topup` and a wide ``fill_spacing``
 plots as the open, faster pattern it was set to instead of getting quietly
-filled back in solid.
+filled back in solid. Leaving ``fill_spacing`` at its own default too picks
+one full ``pen_width`` (tangent, solid) when ``guarantee_coverage`` is on,
+or ``pen_width * _OPEN_SPACING_FACTOR`` when it's off — so the flag has
+something to visibly open up on its own, without also needing
+``fill_spacing`` set by hand.
 
 ``merge_ends`` threads consecutive rings/rows into one continuous stroke
 instead of lifting the pen between each. Every bridge is checked to stay
@@ -118,6 +124,18 @@ leave that feature simply blank — so the constraint is relaxed step by step
 down to the raw outline, inking the feature along its centre and letting the
 nib overhang. Overhang is the only way to mark a stem narrower than the nib,
 and it is what keeps small text legible rather than hollow."""
+
+_OPEN_SPACING_FACTOR = 2.0
+"""What ``HatchParams.fill_spacing`` defaults to, as a multiple of
+``pen_width``, when ``guarantee_coverage`` is off and the caller hasn't set
+``fill_spacing`` explicitly. At the *other* default — one full ``pen_width``,
+used when ``guarantee_coverage`` is on — the primary pattern is already
+~solid, so turning ``guarantee_coverage`` off would otherwise change nothing
+to look at: there'd be nothing left for the skipped top-up pass to have been
+adding back. This gives "off" a spacing it can actually open up, without
+changing what "on" draws (which still resolves to plain ``pen_width``) or
+requiring ``fill_spacing`` to be set by hand just to see the checkbox do
+anything."""
 
 _SPIRAL_JOG_FACTOR = 1.8
 """How far, as a multiple of the ring spacing, the hop from one ring to the
@@ -204,15 +222,18 @@ class HatchParams:
     fill_spacing: float | None = None
     """Line-to-line spacing for the *coverage* fills — spiraling, zigzag and
     glyph_fill — which is a different quantity from ``spacing`` above: it is
-    tied to the pen, not to a pattern. ``None`` means one full ``pen_width``,
-    i.e. adjacent strokes exactly tangent, which is what makes those modes
-    fill solid. Set it smaller to lay ink down heavier (strokes overlap), or
-    larger to open the fill up — but with ``guarantee_coverage`` left at its
-    default of ``True`` the top-up pass will simply re-cover whatever that
-    wider spacing opened, since as far as it can tell that's a gap the
-    pattern left by accident rather than one asked for. Turn
+    tied to the pen, not to a pattern. ``None`` picks the spacing for you,
+    and what it picks depends on ``guarantee_coverage``: one full
+    ``pen_width`` (adjacent strokes exactly tangent, which is what makes
+    those modes fill solid) when it's on, or ``pen_width *
+    _OPEN_SPACING_FACTOR`` when it's off — see ``guarantee_coverage`` for
+    why. Set this explicitly to override either default: smaller lays ink
+    down heavier (strokes overlap), larger opens the fill up further — but
+    with ``guarantee_coverage`` on, the top-up pass will simply re-cover
+    whatever a wider spacing opened, since as far as it can tell that's a gap
+    the pattern left by accident rather than one asked for. Turn
     ``guarantee_coverage`` off to actually get the opened-up, faster-plotting
-    pattern this produces on paper."""
+    pattern a wider spacing sets out to produce."""
     guarantee_coverage: bool = True
     """Whether the coverage fills (spiraling, zigzag, glyph_fill, and
     concentric when its spacing is tangent-or-tighter than the pen) run their
@@ -224,8 +245,15 @@ class HatchParams:
     solid fill, with all the extra strokes that took. Turn this off to skip
     top-up and let the pattern's own spacing stand: coverage is then whatever
     the primary pattern's spacing naturally gives it, no longer guaranteed
-    complete, in exchange for a shorter, sparser plot when that's the
-    goal."""
+    complete, in exchange for a shorter, sparser plot when that's the goal.
+
+    Turning this off changes nothing to look at, on its own, if
+    ``fill_spacing`` is still at its default: tangent spacing is already
+    ~solid, so there is nothing for top-up to have been adding back. That is
+    why leaving ``fill_spacing`` at ``None`` picks a wider default spacing
+    here too — so the checkbox has something to open up by itself, without
+    also requiring ``fill_spacing`` to be set by hand. An explicit
+    ``fill_spacing`` always wins over both defaults."""
 
 
 def hatch_polygon(polygon: BaseGeometry | None, params: HatchParams) -> list[LineString]:
@@ -237,9 +265,13 @@ def hatch_polygon(polygon: BaseGeometry | None, params: HatchParams) -> list[Lin
         return []
 
     tol = params.merge_tolerance
-    step = params.fill_spacing if params.fill_spacing else params.pen_width
-
     guarantee = params.guarantee_coverage
+    if params.fill_spacing:
+        step = params.fill_spacing
+    elif guarantee:
+        step = params.pen_width
+    else:
+        step = params.pen_width * _OPEN_SPACING_FACTOR
     if params.fill_type == FillType.SPIRALING:
         return _spiraling(pieces, params.pen_width, step, params.inset, params.merge_ends, tol, guarantee)
     if params.fill_type == FillType.CONCENTRIC:
@@ -456,12 +488,32 @@ def _oriented(ring: LinearRing, ccw: bool = True) -> LinearRing:
 
 
 def _roll_to(ring: LinearRing, point) -> np.ndarray:
-    """Ring coordinates rotated to begin at the vertex nearest ``point``, closed."""
+    """Ring coordinates rotated to begin at the point on ``ring`` nearest
+    ``point``, closed.
+
+    The seam is inserted by projecting ``point`` onto the ring (continuous
+    arc length via ``project``/``interpolate``) rather than snapping to
+    whichever existing vertex is closest: on a long straight edge — a square,
+    a letter's stem — many vertices sit at nearly the same distance from a
+    given ``point``, so nearest-*vertex* jumps unpredictably between
+    revolutions and each jump is a visible lateral notch cut across the
+    ribbon. Projecting first gives a single, continuous seam position, and
+    only that seam point (not the ring's own vertices) needs inserting into
+    the coordinate list."""
     coords = np.asarray(ring.coords)[:-1]
     if len(coords) == 0:
         return coords
-    k = int(np.argmin((coords[:, 0] - point[0]) ** 2 + (coords[:, 1] - point[1]) ** 2))
-    return np.vstack([coords[k:], coords[:k], coords[k : k + 1]])
+    seam = ring.interpolate(ring.project(Point(point)))
+    d2 = (coords[:, 0] - seam.x) ** 2 + (coords[:, 1] - seam.y) ** 2
+    k = int(np.argmin(d2))
+    seam_xy = np.array([[seam.x, seam.y]])
+    if d2[k] < 1e-12:
+        return np.vstack([coords[k:], coords[:k], coords[k : k + 1]])
+    # k is the vertex right after the seam along the ring's direction (or
+    # right before it — both give a valid split, ``argmin`` just picks
+    # whichever is numerically closer); either way the seam itself still
+    # needs inserting so the path actually starts there, not at a neighbour.
+    return np.vstack([seam_xy, coords[k:], coords[:k], seam_xy])
 
 
 def _spiral_from_chain(chain: list[LinearRing], ring_spacing: float) -> list[LineString]:
@@ -473,11 +525,18 @@ def _spiral_from_chain(chain: list[LinearRing], ring_spacing: float) -> list[Lin
     coverage is exactly the rings' own coverage.
 
     Morphing consecutive rings into a seam-free spiral (blending ring i into
-    ring i+1 across one revolution) was tried and reverted: it looks tidier,
-    but the ring-to-ring correspondence stretches wherever the two rings
-    differ in shape, and the path then skips arcs of the inner ring
-    altogether — measured at ~2.3% of a word's area left bare on 'Salut',
-    versus ~0.3% here. The jog is a much cheaper artefact than a hole."""
+    ring i+1 across one revolution) was tried again here and reverted again:
+    it reads as a genuine spiral on gently-curved letterforms, but on any
+    shape with long straight runs (a square annulus, a straight stem) a
+    per-index lerp between two arc-length-resampled rings does not track the
+    true offset — it cuts a visible comb of teeth across the ribbon, and on
+    one test shape left ~19% of the area uncovered even with :func:`_topup`
+    running afterwards (a self-intersecting-enough path that the same
+    ink-measurement GEOS problem :data:`_INK_CHUNK_POINTS` exists for elsewhere
+    in this file quietly under-reports the gap). Tracing each ring in full
+    sidesteps that class of failure entirely: whatever :func:`_topup` measures
+    as missing here is genuinely missing, not a measurement artefact of the
+    stroke's own shape. The jog is a much cheaper artefact than a hole."""
     rings = [_oriented(r) for r in chain if r.length > 0]
     if not rings:
         return []

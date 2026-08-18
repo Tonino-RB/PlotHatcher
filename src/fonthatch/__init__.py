@@ -1,9 +1,11 @@
 """fonthatch: turn SVG text into pen-plotter hatch-filled outlines.
 
-Given an SVG, every ``<text>`` element is isolated into a "text" layer,
-duplicated into a "hatched" layer (with the "text" layer hidden), and each
-glyph in the "hatched" layer keeps its outline while its interior is filled
-with a plotter-style hatch pattern.
+Given an SVG, the original document — every shape, group, and layer — is
+read and written back unchanged. Every original ``<text>`` element is hidden
+in place (still real text, never converted to outlines), and for each of the
+source file's own top-level layers that has text, a new "<layer> hatched"
+layer is added right after it, where each glyph keeps its outline while its
+interior is filled with a plotter-style hatch pattern.
 
     from fonthatch import process_svg, HatchParams, FillType
 

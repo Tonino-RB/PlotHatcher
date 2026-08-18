@@ -1,16 +1,13 @@
-"""End-to-end orchestration: SVG in -> text/hatched layers -> SVG out."""
+"""End-to-end orchestration: SVG in -> original document + hatched layers -> SVG out."""
 
 from __future__ import annotations
 
-from pathlib import Path
-
+from .compose import compose_svg_string
+from .compose import compose_svg_to_file as _compose_svg_to_file
 from .hatch import HatchParams
-from .layers import DEFAULT_QUANTIZATION, build_document
 from .outlines import GlyphOutline, extract_outlines
 from .render import RenderMode, RenderParams
 from .shaping import shape_block
-from .svg_output import render_svg
-from .svg_output import write_svg as _write_svg
 from .svg_text import extract_text_blocks
 
 
@@ -30,26 +27,23 @@ def _normalize_params(params: RenderParams | HatchParams) -> RenderParams:
 def process_svg_to_string(
     input_svg_path: str,
     params: RenderParams | HatchParams,
-    quantization: float = DEFAULT_QUANTIZATION,
+    *,
+    layer_render_params: dict[int, RenderParams] | None = None,
 ) -> str:
     render_params = _normalize_params(params)
     glyph_outlines = extract_glyph_outlines(input_svg_path)
-    doc, text_id, _hatched_id, _contour_id = build_document(input_svg_path, glyph_outlines, render_params, quantization)
-    return render_svg(doc, hidden_layer_ids=[text_id])
+    return compose_svg_string(input_svg_path, glyph_outlines, render_params, layer_render_params=layer_render_params)
 
 
 def process_svg(
     input_svg_path: str,
     output_svg_path: str,
     params: RenderParams | HatchParams,
-    quantization: float = DEFAULT_QUANTIZATION,
+    *,
+    layer_render_params: dict[int, RenderParams] | None = None,
 ) -> None:
-    if Path(input_svg_path).resolve() == Path(output_svg_path).resolve():
-        raise ValueError(
-            f"Refusing to write output over the input file ({input_svg_path}) — "
-            "choose a different output path."
-        )
     render_params = _normalize_params(params)
     glyph_outlines = extract_glyph_outlines(input_svg_path)
-    doc, text_id, _hatched_id, _contour_id = build_document(input_svg_path, glyph_outlines, render_params, quantization)
-    _write_svg(doc, output_svg_path, hidden_layer_ids=[text_id])
+    _compose_svg_to_file(
+        input_svg_path, output_svg_path, glyph_outlines, render_params, layer_render_params=layer_render_params
+    )

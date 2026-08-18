@@ -43,7 +43,8 @@ def _length(ctx, param, value):
     default=None,
     callback=_length,
     help="Line-to-line spacing for the coverage fills (spiraling/zigzag/glyph-fill). "
-    "Defaults to the pen width, i.e. adjacent strokes exactly tangent.",
+    "Defaults to the pen width (adjacent strokes exactly tangent) with --guarantee-coverage, "
+    "or a wider open spacing with --no-guarantee-coverage.",
 )
 @click.option("--inset", default="0mm", show_default=True, callback=_length, help="Shrink the outline before filling.")
 @click.option("--angle", default=45.0, type=float, show_default=True, help="Hatch angle in degrees (lines/crosshatch).")
@@ -121,13 +122,6 @@ def _length(ctx, param, value):
     show_default=True,
     help="centerline: pen straddles the true outline. outer: pen's outer edge traces it (offset inward by pen-width/2).",
 )
-@click.option(
-    "--quantization",
-    default="0.1mm",
-    show_default=True,
-    callback=_length,
-    help="Bezier-flattening tolerance for passthrough (non-text) SVG content.",
-)
 def main(
     input_svg,
     output_svg,
@@ -148,11 +142,13 @@ def main(
     draw_hatch,
     contour_separate_layer,
     contour_mode,
-    quantization,
 ):
-    """Isolate every <text> element in INPUT_SVG into a hidden "text" layer and
-    a hatch-filled (or single-stroke-font-substituted) "hatched" layer, writing
-    the result to OUTPUT_SVG."""
+    """Hide every <text> element in INPUT_SVG in place and, for each of its
+    own top-level layers that has text, add a new hatch-filled (or
+    single-stroke-font-substituted) "<layer> hatched" layer (and, with
+    --contour-separate-layer, a "<layer> contour" one) right after it.
+    Everything else in INPUT_SVG — shapes, styling, other layers, structure —
+    passes through to OUTPUT_SVG completely unchanged."""
     params = RenderParams(
         mode=RenderMode(mode),
         hatch=HatchParams(
@@ -174,7 +170,7 @@ def main(
         contour_separate_layer=contour_separate_layer,
         contour_mode=ContourMode(contour_mode),
     )
-    process_svg(input_svg, output_svg, params, quantization=quantization)
+    process_svg(input_svg, output_svg, params)
     click.echo(f"Wrote {output_svg}")
 
 

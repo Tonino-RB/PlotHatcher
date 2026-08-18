@@ -115,10 +115,19 @@ def add_text_hatched_layers(
     *,
     overrides: dict[int, RenderParams] | None = None,
     render_cache: dict[tuple, _GlyphRenderResult] | None = None,
-) -> tuple[int, int, int | None]:
+    include_text_layer: bool = True,
+) -> tuple[int | None, int, int | None]:
     """Add "text" (hidden-by-caller), "hatched", and optionally "contour"
     layers to an existing Document in place. Returns
-    ``(text_layer_id, hatched_layer_id, contour_layer_id_or_None)``.
+    ``(text_layer_id_or_None, hatched_layer_id, contour_layer_id_or_None)``.
+
+    ``include_text_layer=False`` skips adding the "text" layer entirely
+    (``text_layer_id`` comes back ``None``) — used by ``compose.py``, which
+    keeps the *original* ``<text>`` elements instead of this outline-derived
+    stand-in (see its module docstring). ``build_document``'s callers (the
+    GUI's live preview, the vpype plugin) still want it: vsketch/vpype can
+    only render line geometry, not real SVG text, so the preview needs an
+    outline substitute to show anything at all.
 
     The "text" layer always holds the *original* glyph outline, regardless
     of render mode or contour options — it's the unmodified reference copy.
@@ -202,9 +211,11 @@ def add_text_hatched_layers(
             (contour_lc if contour_lc is not None else hatched_lc).extend(contour_lines)
         hatched_lc.extend(hatched_lines)
 
-    text_id = document.free_id()
-    document.add(text_lc, layer_id=text_id)
-    document.layers[text_id].set_property(vpype.METADATA_FIELD_NAME, TEXT_LAYER_NAME)
+    text_id = None
+    if include_text_layer:
+        text_id = document.free_id()
+        document.add(text_lc, layer_id=text_id)
+        document.layers[text_id].set_property(vpype.METADATA_FIELD_NAME, TEXT_LAYER_NAME)
 
     hatched_id = document.free_id()
     document.add(hatched_lc, layer_id=hatched_id)
@@ -225,6 +236,22 @@ def add_text_hatched_layers(
     return text_id, hatched_id, contour_id
 
 
+def clone_document(source: vpype.Document) -> vpype.Document:
+    """Deep copy of `source`'s layers (content *and* metadata — name, color,
+    pen width, ...) into a fresh Document, along with its own metadata/page
+    size. ``LineCollection.append()`` always copies each line's coordinate
+    array into a new ``np.array(...)`` regardless of what it's given (see
+    vpype's own source), so a layer added via ``Document.add(lc, ...,
+    with_metadata=True)`` shares no mutable state with `lc` — safe to mutate
+    the clone (e.g. adding fresh layers) without affecting `source`. Used by
+    `build_document`'s `base_document` to reuse an already-parsed SVG instead
+    of re-reading it from disk on every call."""
+    doc = vpype.Document(metadata=source.metadata, page_size=source.page_size)
+    for layer_id, lc in source.layers.items():
+        doc.add(lc, layer_id=layer_id, with_metadata=True)
+    return doc
+
+
 def build_document(
     input_svg_path: str,
     glyph_outlines: list[GlyphOutline],
@@ -233,10 +260,24 @@ def build_document(
     *,
     overrides: dict[int, RenderParams] | None = None,
     render_cache: dict[tuple, _GlyphRenderResult] | None = None,
+    base_document: vpype.Document | None = None,
 ) -> tuple[vpype.Document, int, int, int | None]:
     """Returns ``(document, text_layer_id, hatched_layer_id, contour_layer_id_or_None)``.
-    See :func:`add_text_hatched_layers` for ``overrides``/``render_cache``."""
-    doc = vpype.read_multilayer_svg(input_svg_path, quantization=quantization)
+    See :func:`add_text_hatched_layers` for ``overrides``/``render_cache``.
+
+    ``base_document``, if given, is deep-copied (via :func:`clone_document`)
+    instead of re-reading `input_svg_path` from disk — `quantization` is then
+    ignored, since it only affects that read. The GUI's live preview passes
+    its own (path, mtime)-cached parse here (see sketch.py's
+    ``_cached_base_document``): without it, every redraw — including one
+    triggered by nothing but a hatch-param tweak — re-parsed the whole SVG's
+    non-text content (paths, curves, images, ...) from scratch, which for a
+    file with much non-text content dominated redraw time regardless of how
+    cheap `render_cache` had made the actual hatching. CLI/library/vpype-
+    plugin callers never pass it, so their one-shot behavior is unchanged."""
+    doc = clone_document(base_document) if base_document is not None else vpype.read_multilayer_svg(
+        input_svg_path, quantization=quantization
+    )
     text_id, hatched_id, contour_id = add_text_hatched_layers(
         doc, glyph_outlines, render_params, overrides=overrides, render_cache=render_cache
     )
