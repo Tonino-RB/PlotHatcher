@@ -36,25 +36,29 @@ def _reset_params():
     sketch_module._default_render_params = RenderParams()
     sketch_module._layer_overrides.clear()
     sketch_module._last_seen_render_params = None
-    # `_last_seen_render_params = None` above already makes the very next
-    # draw() look "dirty" regardless of this value (see _sync_selection),
-    # which forces it back to False immediately — so this is just making
-    # that starting state explicit, matching a freshly opened file. Tests
-    # that need to inspect genuinely computed hatch/contour content (not
-    # just structural things like layer names or the export path, which
-    # always compute for real — see `_compute`) must go through `_compute()`.
-    sketch_module._preview_computed = False
+    # Matching reset for the "what's actually displayed" snapshot (see
+    # `sketch_module._preview_has_content`/`_displayed_default_render_params`)
+    # so one test's committed preview can't leak into the next. Tests that
+    # need to inspect genuinely computed hatch/contour content (not just
+    # structural things like layer names or the export path, which always
+    # compute for real — see `_compute`) must go through `_compute()`.
+    sketch_module._displayed_default_render_params = RenderParams()
+    sketch_module._displayed_layer_overrides.clear()
+    sketch_module._preview_has_content = False
+    sketch_module._preview_dirty = False
+    sketch_module._compute_requested = False
 
 
 def _compute():
     """Simulates the sidebar's "Compute Preview" button for a headless test:
-    one redraw to let `_sync_selection` settle whatever was just edited
-    (which otherwise marks the live preview not-yet-computed the instant it
-    runs — see `sketch_module._preview_computed`), then a second, forced
-    redraw that actually renders real hatch/contour content. Returns that
-    second redraw's sketch instance."""
+    one redraw to let `_sync_selection` settle whatever was just edited,
+    then a second, forced redraw — with `_compute_requested` set, same as
+    `FontHatchSketch.request_compute()` does — that actually renders real
+    hatch/contour content and commits it as the displayed preview (see
+    `sketch_module._commit_displayed_params`). Returns that second redraw's
+    sketch instance."""
     FontHatchSketch.execute(finalize=True)
-    sketch_module._preview_computed = True
+    sketch_module._compute_requested = True
     return FontHatchSketch.execute(finalize=True)
 
 
@@ -109,10 +113,21 @@ def _exported_hatched_segment_count(svg_text: str, layer_id: int = 1) -> int:
 
 
 def _hatched_segment_count(sketch) -> int:
+    """Summed across every vpype layer named "hatched", not just the first
+    match: since the live preview now gives each source layer its own
+    "hatched"/"contour" pair (see `layers.add_text_hatched_layers_per_source_layer`)
+    rather than merging every source layer's geometry into one shared pair,
+    a multi-layer file has more than one "hatched"-named layer in
+    `sketch.vsk.document`."""
+    total = 0
+    found = False
     for lc in sketch.vsk.document.layers.values():
         if lc.property(vpype.METADATA_FIELD_NAME) == "hatched":
-            return lc.segment_count()
-    raise AssertionError("no hatched layer found")
+            total += lc.segment_count()
+            found = True
+    if not found:
+        raise AssertionError("no hatched layer found")
+    return total
 
 
 def test_preview_always_shows_both_layers():
@@ -246,6 +261,36 @@ def test_selecting_layer_only_changes_that_layers_settings(tmp_path):
     assert _exported_hatched_segment_count(svg_text) == overridden
 
 
+def test_live_preview_pen_width_is_independent_per_layer(tmp_path):
+    """Regression test: the live preview's rendered stroke thickness (what
+    vpype_viewer's PREVIEW mode draws, driven by each vpype layer's own
+    METADATA_FIELD_PEN_WIDTH property) must reflect each source layer's own
+    configured pen_width independently — giving layer #1 its own override
+    must not touch what layer #2 (never selected) renders at, even though
+    both used to share one merged "hatched" vpype layer with only one pen
+    width property between them."""
+    src = tmp_path / "two_layers.svg"
+    _write_two_layers_svg(src)
+
+    _reset_params()
+    FontHatchSketch.input_path.set_value(str(src))
+    FontHatchSketch.execute(finalize=True)  # settle the shared default before overriding layer #1
+    default_pen_width_px = sketch_module._default_render_params.hatch.pen_width
+
+    FontHatchSketch.selected_layer.set_value(1)
+    FontHatchSketch.pen_width.set_value(0.9)
+    sketch = FontHatchSketch.execute(finalize=True)
+
+    pen_widths = [
+        lc.property(vpype.METADATA_FIELD_PEN_WIDTH)
+        for lc in sketch.vsk.document.layers.values()
+        if lc.property(vpype.METADATA_FIELD_NAME) == "hatched"
+    ]
+    assert len(pen_widths) == 2
+    overridden_px = 0.9 * vpype.convert_length("mm")
+    assert sorted(pen_widths) == pytest.approx(sorted([overridden_px, default_pen_width_px]))
+
+
 def test_switching_selection_shows_that_targets_own_stored_settings(tmp_path):
     """The core "push back" behavior: selecting a layer that already has
     its own recorded settings must make the settings fields reflect those
@@ -302,11 +347,14 @@ def test_reset_selected_layer_clears_override_and_deselects(tmp_path):
     overridden = _hatched_segment_count(_compute())
     assert overridden != baseline
 
-    # Reset it.
+    # Reset it. Dropping the override is itself a settings change, so the
+    # live preview keeps showing the overridden result (see
+    # `sketch_module._preview_has_content`) until explicitly recomputed —
+    # same as any other edit.
     sketch = FontHatchSketch.execute(finalize=True)
     sketch.reset_selected_layer()
     assert FontHatchSketch.selected_layer.value == 0
-    reset_sketch = FontHatchSketch.execute(finalize=True)
+    reset_sketch = _compute()
     assert _hatched_segment_count(reset_sketch) == baseline
 
     # The override is really gone, not just hidden: selecting layer #1
@@ -386,18 +434,16 @@ def test_post_finalize_hides_selection_layer_too(tmp_path):
 def test_mode_switch_changes_hatched_layer_geometry():
     """Regression test for the reported bug where toggling mode appeared to
     have no effect: hatch vs singleline must produce different geometry in
-    the "hatched" layer for the same input/params."""
-
-    def hatched_segment_count() -> int:
-        sketch = FontHatchSketch.execute(finalize=True)
-        return _hatched_segment_count(sketch)
-
+    the "hatched" layer for the same input/params. Both measurements go
+    through `_compute()`: switching mode is itself a settings change, so the
+    live preview keeps showing the *previous* mode's result until explicitly
+    recomputed — see `test_live_preview_withholds_fill_until_computed`."""
     _reset_params()
     FontHatchSketch.mode.set_value("hatch")
     hatch_count = _hatched_segment_count(_compute())
 
     FontHatchSketch.mode.set_value("singleline")
-    singleline_count = hatched_segment_count()
+    singleline_count = _hatched_segment_count(_compute())
 
     assert hatch_count != singleline_count
 
@@ -447,20 +493,22 @@ def test_merge_tolerance_param_headless():
 
 
 def test_live_preview_withholds_fill_until_computed():
-    """Opening a file (or editing a setting) must show only the glyphs' raw
-    outlines — no contour, no hatch fill — until "Compute Preview" is
-    pressed, so opening/scrubbing never pays for the expensive hatch
-    computation unless the user actually asks to see it."""
+    """Opening a file must show only the glyphs' raw outlines — no contour,
+    no hatch fill — until "Compute Preview" is pressed, so opening a file
+    never pays for the expensive hatch computation unless the user actually
+    asks to see it."""
     _reset_params()
     assert _hatched_segment_count(FontHatchSketch.execute(finalize=True)) == 0
 
     computed = _hatched_segment_count(_compute())
     assert computed > 0
 
-    # Editing a setting afterward reverts to the raw-outline preview again,
-    # until Compute Preview is pressed a second time.
+    # Editing a setting afterward must keep showing the last computed
+    # result on screen — not reset back to the raw-outline preview — until
+    # Compute Preview is pressed again.
     FontHatchSketch.spacing.set_value(2.0)
-    assert _hatched_segment_count(FontHatchSketch.execute(finalize=True)) == 0
+    assert _hatched_segment_count(FontHatchSketch.execute(finalize=True)) == computed
+
     assert _hatched_segment_count(_compute()) > 0
 
 

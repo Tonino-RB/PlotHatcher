@@ -236,6 +236,84 @@ def add_text_hatched_layers(
     return text_id, hatched_id, contour_id
 
 
+def _add_text_layer(document: vpype.Document, glyph_outlines: list[GlyphOutline]) -> int:
+    """Adds the "text" layer on its own — the original, unmodified glyph
+    outlines, always one shared layer covering every source layer combined
+    (unlike the hatched/contour layers `add_text_hatched_layers_per_source_layer`
+    builds, which get their own pair *per* source layer) since the text
+    layer never carries a pen-width property that would need resolving per
+    layer in the first place. Split out from `add_text_hatched_layers` so
+    building it doesn't require running the (expensive, shapely-heavy)
+    contour/hatch computation for every glyph merged together under one set
+    of params, only to throw that result away in favor of the per-layer
+    passes `add_text_hatched_layers_per_source_layer` makes afterward."""
+    text_lc = vpype.LineCollection()
+    for glyph in glyph_outlines:
+        if glyph.polygon is not None and not glyph.polygon.is_empty:
+            text_lc.extend(_outline_lines(glyph.polygon))
+    text_id = document.free_id()
+    document.add(text_lc, layer_id=text_id)
+    document.layers[text_id].set_property(vpype.METADATA_FIELD_NAME, TEXT_LAYER_NAME)
+    return text_id
+
+
+def add_text_hatched_layers_per_source_layer(
+    document: vpype.Document,
+    glyph_outlines: list[GlyphOutline],
+    render_params: RenderParams,
+    *,
+    layer_render_params: dict[int, RenderParams] | None = None,
+    render_cache: dict[tuple, _GlyphRenderResult] | None = None,
+) -> tuple[int, dict[int, tuple[int, int | None]]]:
+    """Like `add_text_hatched_layers`, but gives each of the source SVG's own
+    top-level layers (grouped by `GlyphOutline.run.layer_index`, same as
+    `compose.compose_svg`) its own "hatched"/"contour" vpype layer pair,
+    rendered with `layer_render_params`'s entry for that layer index if
+    present else `render_params` — instead of merging every source layer's
+    hatch/contour geometry into one shared pair covering the whole document.
+
+    That merged-pair approach (still what `add_text_hatched_layers` itself
+    does, via `build_document`) is fine for the *geometry* — each glyph
+    already resolves its own effective params regardless of which document
+    layer it ends up in — but a vpype layer can only carry one
+    `METADATA_FIELD_PEN_WIDTH` property, so with everything merged into one
+    pair, only one layer's pen width can ever be reflected in the actual
+    rendered stroke thickness (what vpype_viewer's PREVIEW mode draws) at a
+    time. Splitting by source layer here gives each its own real pen-width
+    property, matching what `compose.compose_svg`'s exported SVG already
+    does for `stroke-width`.
+
+    Every glyph in the same source layer always shares one resolved
+    `RenderParams` (`layer_render_params` is keyed by layer index, same as
+    `_layer_overrides`/`sketch._overrides_for` before this function
+    existed), so no per-glyph `overrides` are needed here the way
+    `add_text_hatched_layers` supports — each layer is rendered as a single
+    `add_text_hatched_layers` call with its own resolved params.
+
+    Returns ``(text_layer_id, {source_layer_index: (hatched_id, contour_id_or_None)})``.
+    """
+    text_id = _add_text_layer(document, glyph_outlines)
+
+    by_layer: dict[int, list[GlyphOutline]] = {}
+    for glyph in glyph_outlines:
+        by_layer.setdefault(glyph.run.layer_index, []).append(glyph)
+
+    layer_render_params = layer_render_params or {}
+    layer_ids: dict[int, tuple[int, int | None]] = {}
+    for source_layer_index in sorted(by_layer):
+        params = layer_render_params.get(source_layer_index, render_params)
+        _, hatched_id, contour_id = add_text_hatched_layers(
+            document,
+            by_layer[source_layer_index],
+            params,
+            render_cache=render_cache,
+            include_text_layer=False,
+        )
+        layer_ids[source_layer_index] = (hatched_id, contour_id)
+
+    return text_id, layer_ids
+
+
 def clone_document(source: vpype.Document) -> vpype.Document:
     """Deep copy of `source`'s layers (content *and* metadata — name, color,
     pen width, ...) into a fresh Document, along with its own metadata/page
@@ -262,19 +340,19 @@ def build_document(
     render_cache: dict[tuple, _GlyphRenderResult] | None = None,
     base_document: vpype.Document | None = None,
 ) -> tuple[vpype.Document, int, int, int | None]:
-    """Returns ``(document, text_layer_id, hatched_layer_id, contour_layer_id_or_None)``.
-    See :func:`add_text_hatched_layers` for ``overrides``/``render_cache``.
+    """Returns ``(document, text_layer_id, hatched_layer_id, contour_layer_id_or_None)``,
+    with every source layer's hatch/contour geometry merged into that one
+    shared hatched/contour pair. See :func:`add_text_hatched_layers` for
+    ``overrides``/``render_cache``; see :func:`build_document_per_layer` for
+    the variant that instead gives each source layer its own pair (what the
+    GUI's live preview actually uses now, so each layer's own pen width is
+    reflected in the rendered stroke thickness rather than just one shared
+    value for the whole document).
 
     ``base_document``, if given, is deep-copied (via :func:`clone_document`)
     instead of re-reading `input_svg_path` from disk — `quantization` is then
-    ignored, since it only affects that read. The GUI's live preview passes
-    its own (path, mtime)-cached parse here (see sketch.py's
-    ``_cached_base_document``): without it, every redraw — including one
-    triggered by nothing but a hatch-param tweak — re-parsed the whole SVG's
-    non-text content (paths, curves, images, ...) from scratch, which for a
-    file with much non-text content dominated redraw time regardless of how
-    cheap `render_cache` had made the actual hatching. CLI/library/vpype-
-    plugin callers never pass it, so their one-shot behavior is unchanged."""
+    ignored, since it only affects that read. CLI/library/vpype-plugin
+    callers never pass it, so their one-shot behavior is unchanged."""
     doc = clone_document(base_document) if base_document is not None else vpype.read_multilayer_svg(
         input_svg_path, quantization=quantization
     )
@@ -282,3 +360,35 @@ def build_document(
         doc, glyph_outlines, render_params, overrides=overrides, render_cache=render_cache
     )
     return doc, text_id, hatched_id, contour_id
+
+
+def build_document_per_layer(
+    input_svg_path: str,
+    glyph_outlines: list[GlyphOutline],
+    render_params: RenderParams,
+    quantization: float = DEFAULT_QUANTIZATION,
+    *,
+    layer_render_params: dict[int, RenderParams] | None = None,
+    render_cache: dict[tuple, _GlyphRenderResult] | None = None,
+    base_document: vpype.Document | None = None,
+) -> tuple[vpype.Document, int, dict[int, tuple[int, int | None]]]:
+    """Same as :func:`build_document`, but built via
+    :func:`add_text_hatched_layers_per_source_layer` instead of
+    :func:`add_text_hatched_layers` — each source layer gets its own
+    "hatched"/"contour" vpype layer pair (with its own resolved pen-width
+    property) rather than one pair shared by the whole document. Used by the
+    GUI's live preview (sketch.py's ``_draw_result``), whose own
+    ``(path, mtime)``-cached parse is what's normally passed as
+    ``base_document`` (see ``sketch.py``'s ``_cached_base_document``) —
+    without it, every redraw would re-parse the whole SVG's non-text content
+    from scratch regardless of how cheap ``render_cache`` made the hatching
+    itself.
+
+    Returns ``(document, text_layer_id, {source_layer_index: (hatched_id, contour_id_or_None)})``."""
+    doc = clone_document(base_document) if base_document is not None else vpype.read_multilayer_svg(
+        input_svg_path, quantization=quantization
+    )
+    text_id, layer_ids = add_text_hatched_layers_per_source_layer(
+        doc, glyph_outlines, render_params, layer_render_params=layer_render_params, render_cache=render_cache
+    )
+    return doc, text_id, layer_ids

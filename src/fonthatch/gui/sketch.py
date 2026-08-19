@@ -143,7 +143,7 @@ import vsketch
 
 from fonthatch.core.compose import compose_svg_string
 from fonthatch.core.hatch import ContourMode, FillType, HatchParams
-from fonthatch.core.layers import DEFAULT_QUANTIZATION, TEXT_LAYER_NAME, build_document
+from fonthatch.core.layers import DEFAULT_QUANTIZATION, TEXT_LAYER_NAME, build_document_per_layer
 from fonthatch.core.outlines import GlyphOutline
 from fonthatch.core.pipeline import extract_glyph_outlines
 from fonthatch.core.render import RenderMode, RenderParams
@@ -161,7 +161,7 @@ _outline_cache: dict[tuple[str, float], list[GlyphOutline]] = {}
 _base_document_cache: dict[tuple[str, float], vpype.Document] = {}
 """(input_path, mtime) -> that file's non-text content, parsed once by
 `vpype.read_multilayer_svg`. Cleared in lockstep with `_outline_cache`. Read
-by `_cached_base_document` and handed to `build_document` as `base_document`
+by `_cached_base_document` and handed to `build_document_per_layer` as `base_document`
 so a redraw triggered by nothing but a hatch-param tweak reuses this instead
 of re-parsing the whole SVG from disk (`clone_document` deep-copies it first,
 so the cached original is never mutated by the fresh hatched/contour/text
@@ -228,24 +228,47 @@ be told apart from one where a setting was genuinely edited — the former
 must not clobber the newly-selected target's stored override with
 whatever the fields happened to still be showing."""
 
-_preview_computed = False
-"""Whether the live preview currently shows the actual hatch/contour result
-(True, after "Compute Preview" was last pressed with nothing since edited)
-or just the raw, unprocessed glyph outlines (False — the default, and what a
-newly opened/changed file starts in). Hatching is the expensive, shapely-
-heavy step (see `add_text_hatched_layers`'s `render_cache` docstring); this
-is what lets opening a file, or scrubbing selected_layer/other settings
-before deciding on final values, skip it entirely until explicitly asked
-for, rather than recomputing on every single redraw the way `render_cache`
-alone (which only skips *unchanged* glyphs, not a from-scratch first
-computation) still would. Set False by `_cached_glyph_outlines` on a
-file/mtime change and by `_sync_selection` on any genuine settings edit; set
-True only by the sidebar's "Compute Preview" button (`_patch_gui_chrome`).
-Never affects `export_full_document` or the stored
-`_default_render_params`/`_layer_overrides` themselves — those always
-reflect the real, currently-configured settings regardless of whether the
-live preview has caught up to them; only what `_draw_result` actually
-renders to the canvas is gated by this.
+_displayed_default_render_params = RenderParams()
+"""The shared-default `RenderParams` last actually rendered on screen — i.e.
+what a from-scratch "Compute Preview" most recently committed. Distinct from
+the *live* `_default_render_params` above, which tracks whatever the
+settings fields currently show (possibly mid-edit, not yet computed). Only
+`_commit_displayed_params` writes this; `_layer_preview_params`/`_draw_result`
+are the only readers, so editing a setting never touches what's on screen until
+the next successful compute overwrites it."""
+_displayed_layer_overrides: dict[tuple[str, int], RenderParams] = {}
+"""Same idea as `_displayed_default_render_params`, but per (input_path,
+layer_index) — the committed counterpart of `_layer_overrides`."""
+_preview_has_content = False
+"""Whether `_displayed_default_render_params`/`_displayed_layer_overrides`
+hold a real, previously-computed hatch/contour result for the *current*
+file (True), or nothing has been computed for it yet (False — the default,
+and what a newly opened/changed file starts in, since `_cached_glyph_outlines`
+resets this on every file/mtime change). While False, `_layer_preview_params` falls
+back to the cheap raw-outline rendering (no contour, no hatch) the same way
+it always did before any "Compute Preview" click; while True, it keeps
+showing the committed result regardless of live edits — see `_preview_dirty`
+for whether that committed result is still current."""
+_preview_dirty = False
+"""Whether the *live* settings (`_default_render_params`/`_layer_overrides`,
+for the current file) have diverged from what's actually displayed
+(`_displayed_default_render_params`/`_displayed_layer_overrides`) since the
+last compute. Recomputed on every `_sync_selection` call via
+`_is_preview_dirty`; used only to decide whether to print the "settings
+changed" hint and whether the sidebar's "Compute Preview" button has
+anything left to do — it never itself affects what `_draw_result` renders,
+which is `_preview_has_content`'s job."""
+_compute_requested = False
+"""Set by the sidebar's "Compute Preview" button; consumed by the very next
+`draw()`, which then renders with the *live* params (a real, possibly
+shapely-heavy computation) instead of the displayed snapshot, and — if that
+succeeds — commits the live params into
+`_displayed_default_render_params`/`_displayed_layer_overrides` via
+`_commit_displayed_params`, making them what subsequent redraws show until
+edited again. Hatching is the expensive step (see
+`add_text_hatched_layers`'s `render_cache` docstring); gating it behind an
+explicit request is what lets opening a file, or scrubbing settings, skip it
+entirely until asked for, rather than recomputing on every single redraw.
 
 Must never be read or written directly from a `_patch_gui_chrome` handler
 (``patched_on_compute``/``patched_redraw_completed``) — those run as plain
@@ -255,16 +278,20 @@ source file a *second*, independent time via ``runpy.run_path`` (see
 ``vsketch_cli.utils.load_sketch_class``, called from
 ``SketchViewer.reload_sketch_class``) to obtain the actual ``FontHatchSketch``
 class `draw()` runs against. That gives the two call sites two entirely
-separate module namespaces, each with its own ``_preview_computed`` global —
-a bare ``global _preview_computed`` write from a handler mutates the
-*imported* copy, invisible to `draw()`'s copy (bound to the `run_path` one),
-so the live preview would never actually pick up the click. Going through
-`FontHatchSketch.set_preview_computed`/`is_preview_computed` instead — real
+separate module namespaces, each with its own ``_compute_requested`` (and
+``_preview_has_content``/``_preview_dirty``) global — a bare ``global
+_compute_requested`` write from a handler mutates the *imported* copy,
+invisible to `draw()`'s copy (bound to the `run_path` one), so the live
+preview would never actually pick up the click. Going through
+`FontHatchSketch.request_compute`/`is_preview_up_to_date` instead — real
 methods on the *class* `self._sketch_class`/`self._sketch` already points at
-— ensures the mutation lands in whichever namespace is actually driving
-`draw()`, since methods close over their own defining module regardless of
-which of the two loads produced the particular class object they're called
-on."""
+— ensures the mutation/read lands in whichever namespace is actually
+driving `draw()`, since methods close over their own defining module
+regardless of which of the two loads produced the particular class object
+they're called on. `_sync_selection`/`_layer_preview_params`/`_commit_displayed_params`,
+by contrast, are always called *from* `draw()` itself, so they're always
+already running in the correct (`run_path`) copy and can read/write these
+globals directly."""
 
 
 def _layer_choice_label(index: int, text: str) -> str:
@@ -280,7 +307,7 @@ def _cached_glyph_outlines(input_path: str) -> list[GlyphOutline] | None:
     hatch params, so it's cached across redraws and only recomputed when
     the file's mtime changes. The file's non-text content (`_base_document_cache`)
     is parsed and cached here too, in lockstep, for the same reason."""
-    global _preview_computed
+    global _preview_has_content, _preview_dirty, _compute_requested
 
     try:
         mtime = os.path.getmtime(input_path)
@@ -291,7 +318,9 @@ def _cached_glyph_outlines(input_path: str) -> list[GlyphOutline] | None:
         _outline_cache.clear()
         _render_cache.clear()
         _base_document_cache.clear()
-        _preview_computed = False
+        _preview_has_content = False
+        _preview_dirty = False
+        _compute_requested = False
         outlines = extract_glyph_outlines(input_path)
         _outline_cache[key] = outlines
         _base_document_cache[key] = vpype.read_multilayer_svg(input_path, quantization=DEFAULT_QUANTIZATION)
@@ -310,7 +339,7 @@ def _cached_glyph_outlines(input_path: str) -> list[GlyphOutline] | None:
 def _cached_base_document(input_path: str) -> vpype.Document | None:
     """The (input_path, mtime)-keyed parse populated by `_cached_glyph_outlines`,
     or None if that hasn't run successfully for this exact (path, mtime) yet —
-    `build_document` falls back to reading from disk itself in that case."""
+    `build_document_per_layer` falls back to reading from disk itself in that case."""
     try:
         mtime = os.path.getmtime(input_path)
     except OSError:
@@ -339,20 +368,52 @@ def _current_target(selected_layer: int) -> int | None:
     return selected_layer if selected_layer > 0 else None
 
 
-def _preview_variant(params: RenderParams) -> RenderParams:
-    """`params` unchanged if the live preview has been (re)computed since its
-    last edit (`_preview_computed`); otherwise a cheap variant with contour
-    and hatch fill both switched off, so `_render_one_glyph` skips its
-    shapely-heavy work entirely and the live preview shows only the glyphs'
-    raw, unprocessed outlines (already-extracted `GlyphOutline.polygon`
-    data, always free — see `add_text_hatched_layers`'s "text" layer). A
-    fresh `dataclasses.replace`, never mutating `params` itself, since it's
-    typically `_default_render_params`/an entry of `_layer_overrides` —
-    shared, persistent state that must keep reflecting the real settings
-    regardless of whether the preview has caught up to them."""
-    if _preview_computed:
-        return params
+def _identity_variant(params: RenderParams) -> RenderParams:
+    return params
+
+
+def _raw_outline_variant(params: RenderParams) -> RenderParams:
+    """A cheap variant of `params` with contour and hatch fill both switched
+    off, so `_render_one_glyph` skips its shapely-heavy work entirely and the
+    live preview shows only the glyphs' raw, unprocessed outlines
+    (already-extracted `GlyphOutline.polygon` data, always free — see
+    `add_text_hatched_layers`'s "text" layer). Used only while nothing has
+    ever been computed for the current file yet (`_preview_has_content` is
+    False). A fresh `dataclasses.replace`, never mutating `params` itself,
+    since it's typically `_default_render_params`/an entry of
+    `_layer_overrides` — shared, persistent state that must keep reflecting
+    the real settings regardless of what the preview is currently showing."""
     return dataclasses.replace(params, draw_contour=False, draw_hatch=False)
+
+
+def _is_preview_dirty(input_path: str) -> bool:
+    """Whether the live settings for `input_path` (`_default_render_params`/
+    `_layer_overrides`) have diverged from what's actually displayed
+    (`_displayed_default_render_params`/`_displayed_layer_overrides`)."""
+    if _default_render_params != _displayed_default_render_params:
+        return True
+    live = {key: value for key, value in _layer_overrides.items() if key[0] == input_path}
+    displayed = {key: value for key, value in _displayed_layer_overrides.items() if key[0] == input_path}
+    return live != displayed
+
+
+def _commit_displayed_params(input_path: str) -> None:
+    """Called by `draw()` right after a `_compute_requested` redraw
+    successfully renders with the live params — copies them into
+    `_displayed_default_render_params`/`_displayed_layer_overrides` so
+    that's what subsequent redraws keep showing until the user edits
+    something and explicitly recomputes again."""
+    global _displayed_default_render_params, _preview_has_content, _preview_dirty, _compute_requested
+
+    _displayed_default_render_params = _default_render_params
+    for key in [key for key in _displayed_layer_overrides if key[0] == input_path]:
+        del _displayed_layer_overrides[key]
+    _displayed_layer_overrides.update(
+        {key: value for key, value in _layer_overrides.items() if key[0] == input_path}
+    )
+    _preview_has_content = True
+    _preview_dirty = False
+    _compute_requested = False
 
 
 def _render_params_for_target(input_path: str, target: int | None) -> RenderParams:
@@ -416,16 +477,18 @@ def _sync_selection(sketch_cls: type, input_path: str, target: int | None, curre
     if the user only just switched selection — and pushes it back into the
     Param objects so the panel always reflects the right thing for
     whatever is currently selected. Returns the resolved RenderParams."""
-    global _default_render_params, _last_seen_render_params, _preview_computed
+    global _default_render_params, _last_seen_render_params, _preview_dirty
 
     if current != _last_seen_render_params:
         if target is None:
             _default_render_params = current
         else:
             _layer_overrides[(input_path, target)] = current
-        if _preview_computed:
-            print("fonthatch: settings changed — press \"Compute Preview\" to update the live preview.")
-        _preview_computed = False
+
+    was_dirty = _preview_dirty
+    _preview_dirty = _is_preview_dirty(input_path)
+    if _preview_dirty and not was_dirty and _preview_has_content:
+        print("fonthatch: settings changed — press \"Compute Preview\" to update the live preview.")
 
     resolved = _render_params_for_target(input_path, target)
     _push_render_params(sketch_cls, resolved)
@@ -454,6 +517,56 @@ def _selection_highlight_lines(glyph_outlines: list[GlyphOutline], target: int |
     return [np.array([complex(x, y) for x, y in corners])]
 
 
+_SECTION_HEADERS: dict[str, str] = {
+    "input_path": "File",
+    "selected_layer": "Layer selection",
+    "mode": "Render mode",
+    "fill_type": "Fill type",
+    "spacing": (
+        "Pattern fills — lines / crosshatch / concentric\n"
+        "Spacing sets the gaps on purpose; never topped up. Concentric is the\n"
+        "exception: set its spacing at or below pen width and it becomes a\n"
+        "solid coverage fill instead (see fill_spacing below)."
+    ),
+    "fill_spacing": (
+        "Coverage fills — spiraling / zigzag / glyph_fill\n"
+        "Fill spacing sets ink density, 0 = auto. Guarantee coverage re-fills\n"
+        "any gap a wider fill spacing opens up — turn it off to actually get\n"
+        "a lighter, faster-plotting fill instead of solid ink."
+    ),
+    "angle": "Shared geometry (applies across fill types except where noted)",
+    "draw_contour": "Contour / outline",
+    "singleline_font": "Singleline mode (render mode = singleline only)",
+}
+"""Section headers inserted into the parameter panel, keyed by whichever
+param starts that section (see `_patch_params_panel_layout`). vsketch's Param
+panel has no grey-out/conditional-visibility mechanism (see module
+docstring), so this — plus `_PARAM_LABELS` below — is the only way to show
+which options pair with which fill type directly in the UI."""
+
+_PARAM_LABELS: dict[str, str] = {
+    "input_path": "Input",
+    "output_path": "Output",
+    "fill_spacing": "Fill spacing",
+    "guarantee_coverage": "Guarantee coverage",
+    "angle": "Angle (lines / crosshatch / zigzag)",
+    "zigzag_passes": "Zigzag passes (zigzag only)",
+}
+"""Short param-panel labels overriding the default `_beautify(name)` one,
+for params whose plain title-cased name doesn't say which fill type(s) they
+apply to. Anything not listed here keeps vsketch_cli's default label."""
+
+_FULL_WIDTH_PARAMS: frozenset[str] = frozenset({"input_path", "output_path"})
+"""Params whose text box gets its label on its own row above (instead of
+beside it) and stretches to the panel's full width — the two file-path
+fields, which need the room a shared two-column form row can't give them."""
+
+_SECTION_HEADING_COLOR = "#5B6EF5"
+"""Accent color for the param panel's section headings (`_SECTION_HEADERS`),
+chosen for enough contrast to read clearly in both light and dark system
+themes rather than blending into plain bold body text."""
+
+
 class FontHatchSketch(vsketch.SketchClass):
     input_path = vsketch.Param("input.svg")
     output_path = vsketch.Param("")
@@ -478,23 +591,32 @@ class FontHatchSketch(vsketch.SketchClass):
 
     fill_type = vsketch.Param(FillType.SPIRALING.value, choices=[f.value for f in FillType])
     spacing = vsketch.Param(1.0, 0.05, 50.0, step=0.1, unit="mm", decimals=2)
+    """Ring/row spacing for the *pattern* fills — lines, crosshatch, concentric.
+    Gaps here are the look and are left alone. Ignored by spiraling/zigzag/
+    glyph_fill entirely (see fill_spacing below), and by concentric too if its
+    own spacing ends up tangent-or-tighter than pen_width — see that field."""
     fill_spacing = vsketch.Param(0.0, 0.0, 50.0, step=0.05, unit="mm", decimals=2)
-    """Line-to-line spacing for the coverage fills (spiraling/zigzag/glyph_fill).
-    0 means "pick it from guarantee_coverage" — the pen width (tangent, solid)
-    when that's on, a wider open spacing when it's off."""
-    inset = vsketch.Param(0.0, 0.0, 50.0, step=0.05, unit="mm", decimals=2)
+    """Line-to-line spacing for the *coverage* fills — spiraling, zigzag,
+    glyph_fill (and concentric, only once its own `spacing` above is set at or
+    below pen_width). 0 means "pick it for me": one full pen_width (tangent,
+    solid) when guarantee_coverage is on, a wider open spacing when it's off.
+    Set by hand: smaller lays ink down heavier, larger opens the fill up —
+    but with guarantee_coverage on, top-up simply re-covers whatever a wider
+    spacing opened, so turn that off first to actually see a lighter fill."""
+    guarantee_coverage = vsketch.Param(True)
+    """Pairs with fill_spacing just above (coverage fills only). On: a top-up
+    pass fills whatever fill_spacing left uncovered, so the fill is always
+    solid no matter what fill_spacing is set to. Off: top-up is skipped, so a
+    fill_spacing opened up wider than the pen actually plots as that lighter,
+    faster, more open pattern instead of being quietly filled back in solid."""
     angle = vsketch.Param(45.0, 0.0, 180.0, step=1.0)
+    """Hatch direction — only used by lines, crosshatch and zigzag."""
+    inset = vsketch.Param(0.0, 0.0, 50.0, step=0.05, unit="mm", decimals=2)
     pen_width = vsketch.Param(0.3, 0.02, 10.0, step=0.02, unit="mm", decimals=2)
     merge_ends = vsketch.Param(True)
     merge_tolerance = vsketch.Param(0.0, 0.0, 20.0, step=0.05, unit="mm", decimals=2)
     zigzag_passes = vsketch.Param(1, 1, 3, step=1)
-    guarantee_coverage = vsketch.Param(True)
-    """On (coverage fills only: spiraling/zigzag/glyph_fill/tangent-or-tighter
-    concentric): the top-up pass tops up whatever fill_spacing left uncovered,
-    so the fill is always solid regardless of fill_spacing. Off: top-up is
-    skipped, so a fill_spacing opened up wider than the pen for a lighter,
-    faster-plotting pattern actually plots that way instead of being filled
-    back in solid."""
+    """Number of zigzag passes (1-3), evenly spread across 180 degrees. Only used by fill_type == zigzag."""
     draw_contour = vsketch.Param(True)
     draw_hatch = vsketch.Param(True)
     """Whether to fill the glyph with the hatch pattern at all (HATCH mode
@@ -533,8 +655,11 @@ class FontHatchSketch(vsketch.SketchClass):
         target = _current_target(self.selected_layer)
         _sync_selection(type(self), self.input_path, target, self._render_params())
 
+        compute_now = _compute_requested
         try:
             self._draw_result(vsk, glyph_outlines, target)
+            if compute_now:
+                _commit_displayed_params(self.input_path)
         except Exception:
             # The interactive viewer redraws on every keystroke while editing
             # params (e.g. a half-typed font name), so a crashing draw() must
@@ -571,26 +696,51 @@ class FontHatchSketch(vsketch.SketchClass):
             contour_mode=ContourMode(self.contour_mode),
         )
 
-    def _overrides_for(self, glyph_outlines: list[GlyphOutline]) -> dict[int, RenderParams]:
-        """Keyed by id(glyph) rather than layer index (see
-        add_text_hatched_layers), so that function stays agnostic of *why*
-        glyphs are grouped — it just gets handed a plain per-glyph
-        mapping. Used only by the live preview (`_draw_result`), which
-        renders every source layer into one shared vpype.Document; the
-        Export path (`export_full_document`) builds one Document per source
-        layer instead (see compose.py) and so uses `_layer_render_params`
-        directly rather than resolving through individual glyphs.
+    def _layer_preview_params(self, glyph_outlines: list[GlyphOutline]) -> dict[int, RenderParams]:
+        """Per-source-layer settings for the live preview, keyed by
+        `GlyphOutline.run.layer_index` (the shape `_draw_result` hands to
+        `build_document_per_layer`'s `layer_render_params`, and
+        `add_text_hatched_layers_per_source_layer` needs one resolved
+        `RenderParams` per source layer, not per glyph — every glyph in the
+        same source layer always shares one).
 
-        Each glyph's stored settings are passed through `_preview_variant`
-        (see `_preview_computed`), so while the live preview hasn't been
-        explicitly (re)computed, this hands back cheap raw-outline params
-        instead of the real, possibly-expensive-to-hatch ones — those real
-        ones stay untouched in `_layer_overrides`/`_default_render_params`
-        (read directly, not through this method, by `export_full_document`
-        and `_layer_render_params`), so Export is never affected."""
+        Which settings get handed back depends on where the live preview
+        stands relative to the last completed compute (see
+        `_compute_requested`/`_preview_has_content`):
+
+        - Mid-compute (`_compute_requested`, i.e. this very draw() is the one
+          "Compute Preview" just triggered): the real, live, possibly
+          expensive-to-hatch settings (`_layer_overrides`/
+          `_default_render_params`) — this is the one redraw that's actually
+          allowed to pay for hatching.
+        - Already have a committed result (`_preview_has_content`): the
+          *displayed* snapshot (`_displayed_layer_overrides`/
+          `_displayed_default_render_params`) — so editing a setting keeps
+          showing the last computed result on screen instead of resetting
+          it, right up until the next compute overwrites it.
+        - Neither (nothing computed yet for this file): the live settings,
+          passed through `_raw_outline_variant` for a cheap raw-outline-only
+          preview.
+
+        Either way, the real settings themselves stay untouched in
+        `_layer_overrides`/`_default_render_params` (read directly, not
+        through this method, by `export_full_document` and
+        `_layer_render_params`), so Export is never affected by any of
+        this."""
+        if _compute_requested:
+            overrides, default, variant = _layer_overrides, _default_render_params, _identity_variant
+        elif _preview_has_content:
+            overrides, default, variant = (
+                _displayed_layer_overrides,
+                _displayed_default_render_params,
+                _identity_variant,
+            )
+        else:
+            overrides, default, variant = _layer_overrides, _default_render_params, _raw_outline_variant
+        layer_indices = {glyph.run.layer_index for glyph in glyph_outlines}
         return {
-            id(glyph): _preview_variant(_layer_overrides.get((self.input_path, glyph.run.layer_index), _default_render_params))
-            for glyph in glyph_outlines
+            layer_index: variant(overrides.get((self.input_path, layer_index), default))
+            for layer_index in layer_indices
         }
 
     def _layer_render_params(self) -> dict[int, RenderParams]:
@@ -620,12 +770,13 @@ class FontHatchSketch(vsketch.SketchClass):
         )
 
     def _draw_result(self, vsk: vsketch.Vsketch, glyph_outlines: list[GlyphOutline], target: int | None) -> None:
-        doc, _text_id, hatched_id, contour_id = build_document(
+        layer_preview_params = self._layer_preview_params(glyph_outlines)
+        doc, _text_id, layer_ids = build_document_per_layer(
             self.input_path,
             glyph_outlines,
             _default_render_params,
             DEFAULT_QUANTIZATION,
-            overrides=self._overrides_for(glyph_outlines),
+            layer_render_params=layer_preview_params,
             render_cache=_render_cache,
             base_document=_cached_base_document(self.input_path),
         )
@@ -663,36 +814,41 @@ class FontHatchSketch(vsketch.SketchClass):
         # unconditionally overwrites every layer's pen-width property with
         # vsk.getPenWidth(layer_id), which falls back to vsketch's own
         # default for any layer that never called penWidth() — setting the
-        # property by hand here would just get clobbered a moment later.
-        # This is what makes vpype_viewer's PREVIEW view mode reflect the
-        # actual configured pen width instead of a generic default. Uses
-        # self.pen_width (whatever's currently displayed — the selected
-        # layer's own override mid-edit, or the shared default otherwise)
-        # rather than _default_render_params: the pen-width *property* is
-        # necessarily one value for the whole layer regardless, so this is
-        # purely about what the live preview shows while editing; the
-        # Export button (export_full_document, above) always uses the
-        # shared default for this property, independent of what's on screen.
-        for lid in (hatched_id, contour_id):
-            if lid is not None and lid in vsk.document.layers:
-                vsk.penWidth(self.pen_width, lid)
+        # property by hand (which add_text_hatched_layers_per_source_layer
+        # already did, per layer, inside build_document_per_layer above)
+        # would just get clobbered a moment later. This is what makes
+        # vpype_viewer's PREVIEW view mode reflect each source layer's own
+        # configured pen width, rather than one shared value for the whole
+        # document — build_document_per_layer gives every source layer its
+        # own hatched_id/contour_id pair specifically so this loop can set
+        # each one from that layer's own resolved params
+        # (layer_preview_params), not just whatever's currently displayed
+        # for the selected layer.
+        for source_layer_index, (hatched_id, contour_id) in layer_ids.items():
+            pen_width = layer_preview_params[source_layer_index].hatch.pen_width
+            for lid in (hatched_id, contour_id):
+                if lid is not None and lid in vsk.document.layers:
+                    vsk.penWidth(pen_width, lid)
 
     @classmethod
-    def set_preview_computed(cls, value: bool) -> None:
-        """Set `_preview_computed` — a real method rather than a bare
+    def request_compute(cls) -> None:
+        """Set `_compute_requested` — a real method rather than a bare
         module-level write, so it always lands in *this* class's own
         defining module's namespace regardless of whether `cls` is the
         normally-imported copy or the separate one `run_path` produces (see
-        `_preview_computed`'s docstring) — callers reliably have `cls` be
+        `_compute_requested`'s docstring) — callers reliably have `cls` be
         whichever one is actually driving `draw()` (`self._sketch_class`/
         `type(self._sketch)`), never the other one."""
-        global _preview_computed
-        _preview_computed = value
+        global _compute_requested
+        _compute_requested = True
 
     @classmethod
-    def is_preview_computed(cls) -> bool:
-        """See `set_preview_computed`."""
-        return _preview_computed
+    def is_preview_up_to_date(cls) -> bool:
+        """Whether the displayed preview already reflects the live settings
+        (there's a committed result, and nothing's been edited since) — i.e.
+        whether "Compute Preview" has nothing left to do. See
+        `request_compute`."""
+        return _preview_has_content and not _preview_dirty
 
     def reset_selected_layer(self) -> None:
         """Drops the currently selected layer's own override (if it has
@@ -792,8 +948,12 @@ def _patch_param_widgets() -> None:
     - ``TextParamWidget`` (used for ``input_path``/``output_path``, the
       only string params with no ``choices``): see module docstring's
       final paragraph — skip the redundant ``setText()`` that otherwise
-      resets the cursor to column 0 on every keystroke.
+      resets the cursor to column 0 on every keystroke. Also strips one
+      layer of matching leading/trailing quotes (and surrounding
+      whitespace) before the text reaches the param, so a
+      quoted/copy-pasted path (e.g. from a shell) is accepted as-is.
     """
+    from PySide6.QtCore import Qt
     from vsketch_cli import param_widget
 
     class _DynamicChoiceParamWidget(param_widget.ChoiceParamWidget):
@@ -813,6 +973,29 @@ def _patch_param_widgets() -> None:
     param_widget.ChoiceParamWidget = _DynamicChoiceParamWidget
 
     class _CursorPreservingTextParamWidget(param_widget.TextParamWidget):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            # A bare QTextEdit defaults to a tall multi-line box, which
+            # looks out of place for a one-line file path — clamp it down
+            # to roughly two wrapped lines and drop the horizontal
+            # scrollbar (vertical still appears if a path ever needs a
+            # third line).
+            self.setFixedHeight(48)
+            self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        def update_param(self):
+            # File managers/terminals often quote paths when copying them
+            # (e.g. dragging a Finder path with spaces into a shell first,
+            # then copying the resulting quoted string) — strip one layer
+            # of matching leading/trailing quotes so the pasted value is
+            # usable as-is instead of erroring as "file not found".
+            text = self.toPlainText().strip()
+            if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
+                text = text[1:-1]
+            self._param.set_value_with_validation(text)
+            # noinspection PyUnresolvedReferences
+            self.value_changed.emit()
+
         def update_from_param(self) -> None:
             new_text = str(self._param.value)
             if self.toPlainText() == new_text:
@@ -825,6 +1008,85 @@ def _patch_param_widgets() -> None:
             self.setTextCursor(cursor)
 
     param_widget.TextParamWidget = _CursorPreservingTextParamWidget
+
+
+def _patch_params_panel_layout() -> None:
+    """Group the parameter panel into labelled sections (`_SECTION_HEADERS`)
+    and give a handful of params shorter, fill-type-specific labels
+    (`_PARAM_LABELS`) — the only way to show "which option goes with which
+    fill type" directly in the UI, since vsketch's Param panel has no
+    grey-out/conditional-visibility mechanism (see module docstring).
+    Installed the same way `_patch_param_widgets` installs its own fixes:
+    swap the name `vsketch_cli.param_widget.ParamsWidget.set_params` binds
+    to, so this must run before that widget is ever built. Looks up
+    `param_widget.ChoiceParamWidget` etc. by attribute at call time (not
+    captured as a local at patch-install time) so it always picks up
+    whatever `_patch_param_widgets` has (re)assigned those names to,
+    regardless of which patch function ran first.
+
+    Also fixes the panel's layout, which QFormLayout otherwise gets wrong
+    for this content:
+      - vsketch_cli never sets an explicit label/form alignment, so the
+        native style's default (right-aligned labels on macOS) is used —
+        pin both to top-left instead.
+      - `input_path`/`output_path` (`_FULL_WIDTH_PARAMS`) get their label
+        on its own row above the box instead of beside it, with the box
+        itself spanning the full row (`addRow(widget)` alone, no label,
+        puts it in QFormLayout's SpanningRole) — a shared two-column row
+        left them too narrow for a real filesystem path.
+      - section headings (`_SECTION_HEADERS`) are tinted with
+        `_SECTION_HEADING_COLOR` instead of plain bold body text, so they
+        read as section titles at a glance.
+    """
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QLabel
+    from vsketch_cli import param_widget
+
+    def patched_set_params(self, params) -> None:
+        while self._layout.rowCount() > 0:
+            self._layout.removeRow(0)
+        self._widgets.clear()
+        self.setVisible(len(params) > 0)
+
+        self._layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        self._layout.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+
+        for name, param in params.items():
+            header = _SECTION_HEADERS.get(name)
+            if header is not None:
+                heading = QLabel(header)
+                heading.setWordWrap(True)
+                heading.setStyleSheet(
+                    f"font-weight: bold; margin-top: 10px; color: {_SECTION_HEADING_COLOR};"
+                )
+                self._layout.addRow(heading)
+
+            if param.choices is not None:
+                widget = param_widget.ChoiceParamWidget(param)
+            elif param.type is int:
+                widget = param_widget.IntParamWidget(param)
+            elif param.type is float:
+                widget = param_widget.FloatParamWidget(param)
+            elif param.type is bool:
+                widget = param_widget.BoolParamWidget(param)
+            else:
+                widget = param_widget.TextParamWidget(param)
+
+            widget.value_changed.connect(self.emitParamUpdated)
+            self._widgets[name] = widget
+            label = _PARAM_LABELS.get(name, param_widget._beautify(name))
+            if param.unit != "":
+                label += f" ({param.unit})"
+
+            if name in _FULL_WIDTH_PARAMS:
+                field_label = QLabel(label)
+                field_label.setStyleSheet("font-weight: 600; margin-top: 6px;")
+                self._layout.addRow(field_label)
+                self._layout.addRow(widget)
+            else:
+                self._layout.addRow(f"{label}:", widget)
+
+    param_widget.ParamsWidget.set_params = patched_set_params
 
 
 def _patch_gui_chrome() -> None:
@@ -850,13 +1112,16 @@ def _patch_gui_chrome() -> None:
         ``FontHatchSketch.reset_selected_layer()`` against the
         last-completed sketch instance and triggers a redraw.
       - add a "Compute Preview" button alongside it: the live preview shows
-        just glyphs' raw outlines (see ``_preview_computed``) until this is
-        pressed, so opening a file or scrubbing settings never runs the
+        just glyphs' raw outlines (see ``_preview_has_content``) until this
+        is pressed for the first time, so opening a file never runs the
         expensive hatch/contour computation until the user actually asks to
-        see it — its handler (``on_compute``) flips ``_preview_computed``
-        True and triggers a redraw; it's disabled whenever the preview
-        already reflects the current settings (nothing to compute), the
-        same way ``reset_btn`` is disabled with nothing selected.
+        see it. After that first press, editing a setting no longer clears
+        what's on screen either — it keeps showing the last computed result
+        (see ``_preview_dirty``) until this button commits a fresh one — its
+        handler (``on_compute``) flips ``_compute_requested`` True and
+        triggers a redraw; it's disabled whenever the preview already
+        reflects the current settings (nothing to compute), the same way
+        ``reset_btn`` is disabled with nothing selected.
       - refresh the parameter panel from the just-completed draw()'s Param
         values every redraw: `draw()` (via `_sync_selection`) may have
         written a different layer's own stored settings into the
@@ -904,13 +1169,13 @@ def _patch_gui_chrome() -> None:
     def patched_redraw_completed(self, sketch) -> None:
         orig_redraw_completed(self, sketch)
         self._sidebar.reset_btn.setEnabled(self._sketch is not None)
-        # Read off self._sketch_class (see `_preview_computed`'s docstring),
+        # Read off self._sketch_class (see `_compute_requested`'s docstring),
         # never the bare module global — this handler was defined in the
         # normally-imported copy of this file, a different namespace than
         # the one `self._sketch_class` (loaded by vsketch_cli via
         # `run_path`) actually draws against.
-        computed = self._sketch_class is not None and self._sketch_class.is_preview_computed()
-        self._sidebar.compute_btn.setEnabled(self._sketch is not None and not computed)
+        up_to_date = self._sketch_class is not None and self._sketch_class.is_preview_up_to_date()
+        self._sidebar.compute_btn.setEnabled(self._sketch is not None and not up_to_date)
         if self._sketch is not None:
             self._sidebar.params_widget.update_from_param()
 
@@ -925,7 +1190,20 @@ def _patch_gui_chrome() -> None:
         # draw(), logged, but not re-raised) or may carry vsketch's own
         # centering transform — export must always reflect the actual source
         # file and settings, independent of what the preview happens to show.
-        svg_text = self._sketch.export_full_document()
+        #
+        # Unlike draw() (called by vsketch's own redraw machinery, which
+        # tolerates a raising callback), this runs as a Qt slot off a button
+        # click — an exception escaping it is unhandled by anything vsketch
+        # provides, so it gets the same try/except draw() already has rather
+        # than risking it propagating out of Qt's event loop.
+        try:
+            svg_text = self._sketch.export_full_document()
+        except Exception:
+            import traceback
+
+            traceback.print_exc()
+            self._sidebar.status_label.setText('<span style="color:red"><b>Export failed (see console)</b></span>')
+            return
         self._sketch._write_output(svg_text)
         self._sidebar.status_label.setText('<span style="color:green"><b>Exported</b></span>')
 
@@ -934,12 +1212,12 @@ def _patch_gui_chrome() -> None:
     def patched_on_compute(self) -> None:
         if self._sketch is None:
             return
-        # Via self._sketch_class, not a bare `global _preview_computed` —
+        # Via self._sketch_class, not a bare `global _compute_requested` —
         # see that variable's docstring: this handler and `draw()` are
         # bound to two different loads of this same source file, each with
         # its own module namespace, so a bare write here would be invisible
         # to `draw()`.
-        self._sketch_class.set_preview_computed(True)
+        self._sketch_class.request_compute()
         self.redraw_sketch()
 
     sketch_viewer.SketchViewer.on_compute = patched_on_compute
@@ -960,6 +1238,7 @@ def launch() -> None:
 
     _patch_comma_decimal_input()
     _patch_param_widgets()
+    _patch_params_panel_layout()
     _patch_gui_chrome()
     vsk_cli.main(args=["run", str(Path(__file__).resolve())], prog_name="vsk", standalone_mode=True)
 
